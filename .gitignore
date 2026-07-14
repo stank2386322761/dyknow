@@ -1,0 +1,37 @@
+# ── 用户数据 / 敏感信息 ──
+data/cookies.json
+data/dyknow.db
+data/videos/
+data/models/
+data/wheels/
+data/*.log
+data/transcribe_progress.json
+data/night_pid.txt
+
+# ── 用户收藏内容 ──
+抖音收藏/
+
+# ── 个人笔记 ──
+量化与股票交易合集.md
+基金运作体系.md
+
+# ── Python ──
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# ── IDE / 工具配置 ──
+.claude/
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ── 内部调试脚本 ──
+scripts/_*.py
+scripts/__pycache__/
