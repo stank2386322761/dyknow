@@ -34,8 +34,8 @@ dependencies = [
 dyknow = "dyknow.main:main"
 
 [project.urls]
-Homepage = "https://github.com/yourusername/dyknow"
-Issues = "https://github.com/yourusername/dyknow/issues"
+Homepage = "https://github.com/stank2386322761/dyknow"
+Issues = "https://github.com/stank2386322761/dyknow/issues"
 
 [tool.setuptools]
 packages = ["dyknow"]
