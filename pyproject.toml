@@ -28,6 +28,7 @@ dependencies = [
     "playwright>=1.40.0",
     "pywhispercpp>=1.5.0",
     "av>=10.0.0",
+    "pyyaml>=6.0",
 ]
 
 [project.scripts]

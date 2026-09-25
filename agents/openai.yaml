@@ -1,0 +1,14 @@
+# agents/openai.yaml
+#
+# 纯 UI / agent metadata。行为规则、工作流、CLI 命令、安全边界与
+# references 加载规则一律维护在 SKILL.md 与 references/*.md。
+#
+# schema 依据：本任务单指定的 interface 结构。
+# 说明：WorkBuddy 官方 skill-creator 的 init_skill.py 模板并不生成
+#       agents/openai.yaml（只生成 SKILL.md + scripts/ + references/ + assets/），
+#       quick_validate.py 亦只校验 SKILL.md 的 name / description。
+#       因此不引入任何未经 schema 明确支持的字段（如 category / keywords / icon）。
+
+interface:
+  display_name: DyKnow
+  short_description: 抖音视频转本地 Markdown 知识库

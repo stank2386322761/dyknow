@@ -20,6 +20,11 @@ from pathlib import Path
 from typing import Optional
 
 from .config import config
+from .state import (
+    TRANSCRIPT_DONE,
+    TRANSCRIPT_FAILED,
+    TRANSCRIPT_PENDING,
+)
 
 
 # 状态常量
@@ -39,6 +44,24 @@ TRANSCRIBE_PIPELINE_STATUSES = {
     STATUS_FAILED,
 }
 
+# 流水线阶段 → 转录维度状态
+#
+# 说明（v2）：数据库的 status 仍然是「转录流水线阶段」，语义不变，
+# 以保证断点续转逻辑不被破坏；新的知识处理维度以独立字段保存。
+PIPELINE_TO_TRANSCRIPT_STATUS = {
+    STATUS_PENDING_INDEX: TRANSCRIPT_PENDING,
+    STATUS_PENDING_DOWNLOAD: TRANSCRIPT_PENDING,
+    STATUS_PENDING_AUDIO: TRANSCRIPT_PENDING,
+    STATUS_PENDING_TRANSCRIBE: TRANSCRIPT_PENDING,
+    STATUS_TRANSCRIBED: TRANSCRIPT_DONE,
+    STATUS_FAILED: TRANSCRIPT_FAILED,
+}
+
+
+def pipeline_to_transcript_status(status: str) -> str | None:
+    """把流水线阶段映射为 transcript_status（未知阶段返回 None）"""
+    return PIPELINE_TO_TRANSCRIPT_STATUS.get(str(status or "").strip())
+
 
 class SyncDB:
     """同步状态数据库"""
@@ -50,6 +73,8 @@ class SyncDB:
     @property
     def conn(self) -> sqlite3.Connection:
         if self._conn is None:
+            # 确保数据目录存在（首次运行时 data/ 可能尚未创建）
+            Path(self.db_path).parent.mkdir(parents=True, exist_ok=True)
             self._conn = sqlite3.connect(str(self.db_path))
             self._conn.row_factory = sqlite3.Row
             self._init_tables()
@@ -73,6 +98,11 @@ class SyncDB:
                 audio_path TEXT DEFAULT '',
                 attempts INTEGER DEFAULT 0,
                 last_error TEXT DEFAULT '',
+                transcript_status TEXT DEFAULT '',
+                processing_status TEXT DEFAULT '',
+                category TEXT DEFAULT '',
+                transcript_hash TEXT DEFAULT '',
+                summarized_from_hash TEXT DEFAULT '',
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
@@ -94,6 +124,12 @@ class SyncDB:
             ("audio_path", "TEXT DEFAULT ''"),
             ("attempts", "INTEGER DEFAULT 0"),
             ("last_error", "TEXT DEFAULT ''"),
+            # v2：知识处理维度字段（不改动既有 status 流水线语义）
+            ("transcript_status", "TEXT DEFAULT ''"),
+            ("processing_status", "TEXT DEFAULT ''"),
+            ("category", "TEXT DEFAULT ''"),
+            ("transcript_hash", "TEXT DEFAULT ''"),
+            ("summarized_from_hash", "TEXT DEFAULT ''"),
         ]
         for col, decl in migrations:
             if col not in existing_cols:
@@ -139,7 +175,13 @@ class SyncDB:
         self.conn.commit()
 
     def update_status(self, aweme_id: str, status: str, **kwargs):
-        """更新状态和可选字段"""
+        """
+        更新流水线状态和可选字段。
+
+        status 仍表示转录流水线阶段（pending_* / transcribed / failed），
+        以便断点续转逻辑完全不受影响；同时自动同步 transcript_status 维度。
+        processing_status / category 等只在显式传入时更新。
+        """
         now = datetime.now().isoformat()
         sets = ["status = ?", "updated_at = ?"]
         params = [status, now]
@@ -148,8 +190,16 @@ class SyncDB:
         allowed = {
             "note_path", "video_path", "audio_path",
             "title", "last_error", "attempts",
+            "transcript_status", "processing_status", "category",
+            "transcript_hash", "summarized_from_hash",
         }
-        for key, val in kwargs.items():
+        updates = dict(kwargs)
+        if not updates.get("transcript_status"):
+            derived = pipeline_to_transcript_status(status)
+            if derived:
+                updates["transcript_status"] = derived
+
+        for key, val in updates.items():
             if key in allowed:
                 sets.append(f"{key} = ?")
                 params.append(val)
@@ -247,6 +297,56 @@ class SyncDB:
             aweme_id, STATUS_PENDING_INDEX,
             last_error="", audio_path="",
         )
+
+    # ── v2：知识处理维度 ──────────────────────────
+
+    def update_note_path(self, aweme_id: str, note_path: str):
+        """移动笔记后同步数据库中的路径，保持一致"""
+        if not note_path:
+            return
+        now = datetime.now().isoformat()
+        self.conn.execute(
+            "UPDATE sync_log SET note_path = ?, updated_at = ? WHERE aweme_id = ?",
+            (str(note_path), now, str(aweme_id)),
+        )
+        self.conn.commit()
+
+    def set_processing_status(self, aweme_id: str, value: str, category: str = ""):
+        """写入 AI 知识处理维度状态（不触碰流水线 status）"""
+        now = datetime.now().isoformat()
+        sets = ["processing_status = ?", "updated_at = ?"]
+        params: list = [value, now]
+        if category:
+            sets.append("category = ?")
+            params.append(category)
+        params.append(str(aweme_id))
+        self.conn.execute(
+            f"UPDATE sync_log SET {', '.join(sets)} WHERE aweme_id = ?",
+            params,
+        )
+        self.conn.commit()
+
+    def get_by_source_id(self, source_id: str) -> Optional[dict]:
+        """按 source_id（即 aweme_id）取单条记录"""
+        row = self.conn.execute(
+            "SELECT * FROM sync_log WHERE aweme_id = ?", (str(source_id),)
+        ).fetchone()
+        return dict(row) if row else None
+
+    def get_all(self, limit: int = 0) -> list[dict]:
+        """取出全部记录（索引重建 / 归档扫描使用）"""
+        sql = "SELECT * FROM sync_log ORDER BY created_at ASC"
+        if limit > 0:
+            sql += f" LIMIT {limit}"
+        return [dict(r) for r in self.conn.execute(sql).fetchall()]
+
+    def get_processing_breakdown(self) -> dict[str, int]:
+        """AI 知识处理维度统计（空值计为 pending）"""
+        rows = self.conn.execute(
+            "SELECT processing_status, COUNT(*) AS cnt FROM sync_log "
+            "GROUP BY processing_status"
+        ).fetchall()
+        return {(r["processing_status"] or "pending"): r["cnt"] for r in rows}
 
     # ── meta 读写 ──────────────────────────────
 

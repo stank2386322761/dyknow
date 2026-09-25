@@ -3,6 +3,14 @@
 DyKnow 笔记统一归档 v3
 - 所有笔记归入 抖音收藏知识库/
 - 内部按 6大类 → 26个子类 细分
+
+⚠️ v1 遗留脚本：分类规则硬编码在本文件中，且未走 taxonomy 注册表。
+   v2 起请优先使用:
+
+       python -m dyknow organize            # 按分类安全归档（读取 taxonomy.yaml）
+       python -m dyknow organize --dry-run  # 先预览计划
+
+   本脚本不再删除任何非空目录，避免误删尚未归档的用户笔记。
 """
 import shutil, sqlite3, re, sys
 from pathlib import Path
@@ -265,22 +273,16 @@ def main():
 
     conn.commit()
 
-    # ── 清理旧空目录 ──
-    old_dirs = {"AI工具与开发", "AI视频创作", "投资与商业", "自媒体运营", "未分类"}
+    # ── 清理旧空目录（只删空目录；非空目录一律保留） ──
+    old_dirs = {"AI工具与开发", "AI视频创作", "投资与商业", "自媒体运营"}
     for d in sorted(OUTPUT.iterdir()):
         if d.is_dir() and d.name in old_dirs:
             try:
                 d.rmdir()
-                print(f"  清理旧目录: {d.name}/")
+                print(f"  清理旧空目录: {d.name}/")
             except OSError:
-                # 非空，强行递归删
-                for f in d.rglob("*"):
-                    f.unlink(missing_ok=True)
-                for sd in sorted(d.rglob("*"), reverse=True):
-                    if sd.is_dir():
-                        sd.rmdir()
-                d.rmdir()
-                print(f"  清理旧目录(强): {d.name}/")
+                # 非空 → 里面可能还有尚未归档的笔记，绝不删除
+                print(f"  跳过非空目录（未删除）: {d.name}/")
 
     conn.commit()
 

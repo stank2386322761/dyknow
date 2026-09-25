@@ -222,8 +222,7 @@ class TestGenerator(unittest.TestCase):
     def test_safe_filename_combined(self):
         """组合场景：多种特殊字符混合"""
         from dyknow.generator import safe_filename
-        dirty = '视频"标题": 测试/文件\\名<第1集>?*|
-CON'
+        dirty = '视频"标题": 测试/文件\\名<第1集>?*|\nCON'
         result = safe_filename(dirty)
         # 不包含任何 Windows 禁用字符
         for ch in r'\/:*?<>|':
@@ -256,7 +255,14 @@ CON'
         self.assertIn("测试作者", content)
         # 不应有 AI 摘要占位符
         self.assertNotIn("待生成", content)
-        self.assertIn("status: done", content)
+        # 状态模型 v2：有转录 → transcript_status done；AI 处理尚未开始 → processing pending
+        self.assertIn("transcript_status: done", content)
+        self.assertIn("processing_status: pending", content)
+        # 旧字段继续写出以保持向后兼容
+        self.assertIn("status: transcribed", content)
+        # 纯数字 ID 必须带引号，避免被 YAML 解析成整数而丢精度
+        self.assertIn('source_id: "7234567890123456789"', content)
+        self.assertIn("transcript_hash:", content)
 
     def test_generate_note_without_transcript(self):
         from dyknow.generator import generate_note

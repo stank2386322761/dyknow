@@ -27,10 +27,17 @@ def cmd_status(_args):
     print(f"笔记目录: {config.output_dir}")
     print(f"数据库:   {config.db_path}")
     print()
-    print("各状态条目数:")
+    print("转录流水线状态:")
     for status_name, cnt in sorted(db.get_status_breakdown().items()):
         print(f"  {status_name:<22} {cnt:>5}")
     print(f"  {'总计':<22} {db.total_count():>5}")
+
+    breakdown = db.get_processing_breakdown()
+    if breakdown:
+        print()
+        print("AI 知识处理状态:")
+        for name in ("pending", "done", "needs_review"):
+            print(f"  {name:<22} {breakdown.get(name, 0):>5}")
     db.close()
     return 0
 
@@ -126,6 +133,142 @@ def cmd_parse(args):
     return 1
 
 
+def cmd_browse(args):
+    from .syncer import Syncer
+    return Syncer().browse(
+        keyword=args.keyword,
+        count=args.count,
+        transcribe=args.transcribe,
+        full=args.full,
+    )
+
+
+def _resolve_output(args) -> Path:
+    """确定知识库根目录：命令行 --output 优先，其次配置（含环境变量）"""
+    raw = getattr(args, "output", None)
+    if raw:
+        return Path(raw).expanduser()
+    return config.output_dir
+
+
+def _rel(path: Path, root: Path) -> str:
+    try:
+        return str(Path(path).relative_to(root))
+    except ValueError:
+        return str(path)
+
+
+def cmd_index(args):
+    """全量重建知识库索引（根索引 + 分类索引）"""
+    from .indexer import rebuild_index
+
+    root = _resolve_output(args)
+    if not root.exists():
+        print(f"知识库目录不存在: {root}")
+        return 1
+
+    result = rebuild_index(root, category_indexes=not args.no_category_index)
+    st = result["stats"]
+
+    print("\n索引已重建")
+    print("=" * 50)
+    for p in result["written"]:
+        print(f"  ✅ {_rel(p, root)}")
+    print("-" * 50)
+    print(
+        f"  已处理 {st['processed']} | 待处理 {st['pending']} "
+        f"| 待聚类 {st['pending_cluster']} | 待复核 {st['needs_review']}"
+    )
+    if result["warnings"]:
+        print("-" * 50)
+        for w in result["warnings"][:20]:
+            print(f"  ⚠️  {w}")
+        if len(result["warnings"]) > 20:
+            print(f"  ... 另有 {len(result['warnings']) - 20} 条提示")
+    return 0
+
+
+def cmd_organize(args):
+    """按分类建议安全移动笔记（区分未处理 / 待聚类）"""
+    from .organizer import Organizer
+
+    root = _resolve_output(args)
+    if not root.exists():
+        print(f"知识库目录不存在: {root}")
+        return 1
+
+    org = Organizer(root, dry_run=args.dry_run, migrate=args.migrate)
+    plans, _ = org.plan()
+    result = org.apply(plans)
+
+    mode = "[试用模式] " if args.dry_run else ""
+    print(f"\n{mode}归档结果")
+    print("=" * 50)
+    if result.registered:
+        print(f"  新注册分类: {', '.join(result.registered)}")
+
+    verb = "计划移动" if args.dry_run else "已移动"
+    print(f"  {verb}: {len(result.moved)}")
+    for p in result.moved[:50]:
+        print(f"     {_rel(p.src, root)}  →  {_rel(p.dst, root)}   （{p.reason}）")
+    if len(result.moved) > 50:
+        print(f"     ... 另有 {len(result.moved) - 50} 条")
+
+    print(f"  ⏭️  跳过: {len(result.skipped)}")
+    if result.cleaned_dirs:
+        print(f"  🧹 清理旧空目录: {', '.join(result.cleaned_dirs)}")
+
+    if result.conflicts:
+        print(f"  ⚠️  内容冲突（两份均已保留，未自动合并）: {len(result.conflicts)}")
+        for note in result.conflicts[:20]:
+            print(f"     {note}")
+        if len(result.conflicts) > 20:
+            print(f"     ... 另有 {len(result.conflicts) - 20} 条")
+
+    if result.failed:
+        print(f"  ❌ 失败: {len(result.failed)}")
+        for p, err in result.failed:
+            print(f"     {_rel(p.src, root)}: {err}")
+
+    if result.warnings:
+        print("-" * 50)
+        for w in result.warnings[:10]:
+            print(f"  ⚠️  {w}")
+
+    if args.dry_run:
+        print("\n未修改任何文件。去掉 --dry-run 即按上述计划执行。")
+    return 0
+
+
+def cmd_taxonomy(args):
+    """查看分类注册表"""
+    from .taxonomy import Taxonomy
+
+    root = _resolve_output(args)
+    tax = Taxonomy(root).load()
+    print(f"\n分类注册表: {tax.path}")
+
+    if not tax.exists():
+        print("  （尚未创建，运行 organize 后会在达到阈值时自动生成）")
+
+    if args.paths_only:
+        for p in tax.all_paths():
+            print(p)
+        return 0
+
+    if not tax.categories:
+        print("  （暂无分类）")
+        return 0
+
+    for top in tax.categories:
+        alias = f"  别名: {', '.join(top.aliases)}" if top.aliases else ""
+        print(f"  📂 {top.name}{alias}")
+        for child in top.children:
+            calias = f"  别名: {', '.join(child.aliases)}" if child.aliases else ""
+            print(f"     └ {child.name}{calias}")
+    return 0
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="DyKnow — 抖音收藏自动化知识库工具",
@@ -134,7 +277,8 @@ def main():
 场景:
   A) 单视频    dyknow parse "<含抖音链接的文字>"
   B) 批量同步  dyknow sync
-  C) 批量转录  dyknow transcribe        # 支持断点续转、Ctrl+C 安全退出
+  C) 关键词    dyknow browse -k "关键词"
+  D) 知识库    dyknow organize  →  dyknow index
 
 示例:
   dyknow login                    扫码登录
@@ -144,7 +288,10 @@ def main():
   dyknow sync --transcribe        同步+转录
   dyknow transcribe               断点续转
   dyknow transcribe --retry-failed 仅重试失败项
-  dyknow transcribe --count 50    本次最多处理 50 条
+  dyknow browse -k "AI工具" --count 30
+  dyknow organize --dry-run       预览归档计划
+  dyknow organize                 按分类归档
+  dyknow index                    全量重建索引
   dyknow reset --target transcribed --yes  把已转录项全部重置
         """,
     )
@@ -205,6 +352,35 @@ def main():
     pp.add_argument("--output", "-o", default=None)
     pp.add_argument("--no-transcribe", action="store_true")
 
+    # browse：关键词浏览 / 自动研究（场景 C）
+    bp = sub.add_parser("browse", help="按关键词浏览抖音内容（场景 C）")
+    bp.add_argument("-k", "--keyword", required=True, help="搜索关键词")
+    bp.add_argument("--count", type=int, default=30, help="目标条数（默认 30）")
+    bp.add_argument("--transcribe", action="store_true", help="同时下载并转录")
+    bp.add_argument("--full", action="store_true", help="包含已同步过的内容")
+
+    # index：全量重建索引
+    ip = sub.add_parser("index", help="全量重建知识库索引")
+    ip.add_argument("--output", default=None, help="知识库根目录")
+    ip.add_argument("--no-category-index", action="store_true", help="不生成分类索引")
+
+    # organize：按分类安全归档
+    op = sub.add_parser("organize", help="按分类安全移动笔记")
+    op.add_argument("--output", default=None, help="知识库根目录")
+    op.add_argument("--dry-run", action="store_true", help="只显示计划，不修改文件")
+    op.add_argument(
+        "--migrate", action="store_true",
+        help="同时迁移旧「未分类/」目录中的笔记（默认不迁移）",
+    )
+
+    # taxonomy：查看分类注册表
+    xp = sub.add_parser("taxonomy", help="查看分类注册表")
+    xp.add_argument("--output", default=None, help="知识库根目录")
+    xp.add_argument(
+        "--paths", dest="paths_only", action="store_true",
+        help="只输出分类路径列表",
+    )
+
     args = parser.parse_args()
 
     if not args.command:
@@ -219,6 +395,10 @@ def main():
         "reset": cmd_reset,
         "parse": cmd_parse,
         "night": cmd_night,
+        "browse": cmd_browse,
+        "index": cmd_index,
+        "organize": cmd_organize,
+        "taxonomy": cmd_taxonomy,
     }
     handler = handlers.get(args.command)
     return handler(args) if handler else 1

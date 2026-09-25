@@ -1,17 +1,36 @@
 """
 Markdown 笔记生成器 —— Obsidian 兼容格式
 
-模板参考：抖音视频转MD文档最佳实践
+职责：
+    1. 生成新笔记（frontmatter + 结构化正文）
+    2. 把转录文本回填进已有笔记
+    3. 提供原子写入，避免同步盘锁定 / 进程中断导致文件截断
+
+frontmatter 字段与状态含义见 references/note-schema.md。
 """
 
 import logging
 import os
 import re
+import time as _time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+from . import frontmatter as fm_io
 from .config import config
+from .layout import UNPROCESSED_DIR
+from .state import (
+    PROCESSING_DONE,
+    PROCESSING_NEEDS_REVIEW,
+    PROCESSING_PENDING,
+    TRANSCRIPT_DONE,
+    TRANSCRIPT_FAILED,
+    TRANSCRIPT_PENDING,
+    TRANSCRIPT_SECTION_HEADING,
+    legacy_status_of,
+    transcript_hash,
+)
 
 logger = logging.getLogger("dyknow.generator")
 
@@ -27,6 +46,14 @@ _WIN_RESERVED_NAMES = {
     "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
 }
 
+# 正文区块标题
+SUMMARY_HEADING = "🤖 AI 摘要"
+OVERVIEW_HEADING = "📌 概述"
+CHAPTER_HEADING = "🎬 章节要点"
+QUOTE_HEADING = "💡 金句 / 可复用素材"
+
+PLACEHOLDER_SUMMARY = "_待模型填写_"
+
 
 def safe_filename(title: str, max_len: int = 60) -> str:
     """
@@ -37,14 +64,16 @@ def safe_filename(title: str, max_len: int = 60) -> str:
     2. 移除所有控制字符 (0x00-0x1F, 0x7F)
     3. 将 Windows 禁用字符 \\ / : * ? " < > | 替换为 _（引号用单引号替代）
     4. 将方括号替换为圆括号（Obsidian 兼容）
-    5. 去除首尾空格和句点（Windows 不允许）
-    6. 若结果为空或为 Windows 保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9），追加下划线
-    7. 截断到 max_len 并去除尾部空格
+    5. 先去除首尾空白，再合并连续空白/下划线
+       （先 strip 是为了避免首尾空格被压成下划线，产生 "_hello_" 这类结果）
+    6. 去除首尾空格和句点（Windows 不允许）
+    7. 若结果为空或为 Windows 保留名（CON/PRN/AUX/NUL/COM1-9/LPT1-9），追加下划线
+    8. 截断到 max_len 并去除尾部空格与句点
     """
     if not title:
         return "_"
 
-    safe = title
+    safe = str(title)
     # 1. 换行/制表 → 空格
     safe = safe.replace("\n", " ").replace("\r", " ").replace("\t", " ")
     # 2. 移除控制字符
@@ -54,15 +83,18 @@ def safe_filename(title: str, max_len: int = 60) -> str:
     safe = _WIN_FORBIDDEN_CHARS_RE.sub("_", safe)
     # 4. 方括号 → 圆括号（Obsidian 兼容）
     safe = safe.replace("[", "(").replace("]", ")")
-    # 5. 合并连续空格/下划线
+    # 5. 先去掉首尾空白，再合并连续空白/下划线
+    safe = safe.strip()
     safe = re.sub(r'[_\s]{2,}', '_', safe)
     # 6. 去除首尾空格和句点
     safe = safe.strip(" .")
     # 7. 截断到 max_len
-    safe = safe[:max_len].strip()
-    # 8. 空结果或 Windows 保留名 → 追加下划线
-    if not safe or safe.upper() in _WIN_RESERVED_NAMES:
-        safe = (safe or "_") + "_"
+    safe = safe[:max_len].strip(" .")
+    # 8. 空结果 → 占位符；Windows 保留名 → 追加下划线避免冲突
+    if not safe:
+        safe = "_"
+    elif safe.upper() in _WIN_RESERVED_NAMES:
+        safe = safe + "_"
 
     return safe
 
@@ -70,8 +102,46 @@ def safe_filename(title: str, max_len: int = 60) -> str:
 def _format_duration(ms: int) -> str:
     if not ms:
         return ""
-    total_sec = ms // 1000
+    total_sec = int(ms) // 1000
     return f"{total_sec // 60:02d}:{total_sec % 60:02d}"
+
+
+# ── 原子写入 ──────────────────────────────────
+
+
+def atomic_write_text(path: Path, content: str):
+    """
+    原子写入文本：先写同目录临时文件，再 os.replace 替换。
+
+    避免断点续转时 Ctrl+C / 进程崩溃导致原文件被截断。
+    百度同步盘可能锁定目标文件，失败时重试。
+    """
+    path = Path(path)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        for attempt in range(5):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt < 4:
+                    _time.sleep(1)
+                else:
+                    raise
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
+# 旧名字保留，避免外部脚本引用失效
+_atomic_write_text = atomic_write_text
+
+
+# ── 生成新笔记 ────────────────────────────────
 
 
 def generate_note(
@@ -89,54 +159,62 @@ def generate_note(
     favorite_time: str = "",
     transcript: str = "",
     output_dir: Optional[Path] = None,
+    source_id: str = "",
+    category: str = "",
 ) -> Path:
-    """生成一条完整的 Obsidian 笔记"""
+    """生成一条完整的 Obsidian 笔记，返回文件路径"""
 
     today = datetime.now().strftime("%Y-%m-%d")
     safe_title = safe_filename(title)
     duration_str = _format_duration(duration)
+    sid = source_id or aweme_id
 
-    # 确定证据等级
-    evidence_level = "transcript" if transcript else "indexed"
-    status = "done" if transcript else "indexed"
+    has_transcript = bool(transcript and transcript.strip())
+    transcript_status = TRANSCRIPT_DONE if has_transcript else TRANSCRIPT_PENDING
+    processing_status = PROCESSING_PENDING
+    t_hash = transcript_hash(transcript) if has_transcript else ""
+    evidence_level = "transcript" if has_transcript else "indexed"
 
-    # 输出目录
+    # 未指定输出目录时，新内容进入「未处理」，由 organize 再按分类归档
     if output_dir is None:
-        folder = favorite_folder.strip() if favorite_folder else "未分类"
-        safe_folder = safe_filename(folder, 30) if folder != "未分类" else "未分类"
-        output_dir = config.output_dir / safe_folder
+        output_dir = config.output_dir / UNPROCESSED_DIR
+    output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # ── Frontmatter ──
-    fm = f"""---
-title: "{safe_title}"
-video_id: "{aweme_id}"
-source: "https://www.douyin.com/video/{aweme_id}"
-author: "{author}"
-author_id: "{author_id}"
-platform: douyin
-date: {today}
-"""
+    # ── frontmatter ──
+    meta: dict = {
+        "title": safe_title,
+        "video_id": aweme_id,
+        "source_id": sid,
+        "source": f"https://www.douyin.com/video/{aweme_id}",
+        "author": author,
+        "author_id": author_id,
+        "platform": "douyin",
+        "date": today,
+    }
     if duration_str:
-        fm += f"duration: {duration_str}\n"
+        meta["duration"] = duration_str
     if favorite_folder:
-        fm += f'favorite_folder: "{favorite_folder}"\n'
-    fm += f"""likes: {likes}
-comments: {comments}
-shares: {shares}
-plays: {plays}
-evidence_level: {evidence_level}
-status: {status}
-tags: [抖音, 收藏]
----"""
+        meta["favorite_folder"] = favorite_folder
+    meta.update({
+        "likes": likes,
+        "comments": comments,
+        "shares": shares,
+        "plays": plays,
+        "evidence_level": evidence_level,
+        "transcript_status": transcript_status,
+        "processing_status": processing_status,
+        "category": category,
+        "transcript_hash": t_hash,
+        "summarized_from_hash": "",
+        # 旧字段继续写出，保持向后兼容；新逻辑不再只依赖它做判断
+        "status": legacy_status_of(transcript_status, processing_status),
+        "tags": ["抖音", "收藏"],
+    })
 
     # ── 正文 ──
     body = f"""
 # {safe_title}
-
-## 📌 概述
-
-> 待模型总结后填入
 
 ## 📊 数据快照
 
@@ -160,90 +238,159 @@ tags: [抖音, 收藏]
 > - **作者**: [{author}](https://www.douyin.com/user/{author_id})
 > - **链接**: [抖音原视频](https://www.douyin.com/video/{aweme_id})
 > - **日期**: {today}
+
+---
+
+## {SUMMARY_HEADING}
+
+### 一句话总结
+{PLACEHOLDER_SUMMARY}
+
+### 要点
+{PLACEHOLDER_SUMMARY}
+
+### 金句
+{PLACEHOLDER_SUMMARY}
+
+---
+
+## {TRANSCRIPT_SECTION_HEADING}
+
+{transcript if has_transcript else "_待转录..._"}
+
+---
+
+## {CHAPTER_HEADING}
+
+{PLACEHOLDER_SUMMARY}
+
+---
+
+## {QUOTE_HEADING}
+
+{PLACEHOLDER_SUMMARY}
+
+---
+
+## 🔗 相关链接
+
+- [抖音原视频](https://www.douyin.com/video/{aweme_id})
 """
-
-    body += "\n---\n\n"
-
-    # ── 转录文本 ──
-    if transcript:
-        body += f"## 📝 完整转写\n\n{transcript}\n\n"
-    else:
-        body += "## 📝 完整转写\n\n_待转录..._\n\n"
-
-    body += "---\n\n"
-
-    # ── 章节要点 ──
-    body += "## 🎬 章节要点\n\n_待转录后生成_\n\n"
-
-    body += "---\n\n"
-
-    # ── 可复用素材 ──
-    body += "## 💡 金句 / 可复用素材\n\n_待总结后填入_\n\n"
-
-    body += "---\n\n## 🔗 相关链接\n\n"
-    body += f"- [抖音原视频](https://www.douyin.com/video/{aweme_id})\n"
     if author_id:
         body += f"- [@{author}](https://www.douyin.com/user/{author_id})\n"
 
-    # 写入
-    filename = f"{safe_title}_{aweme_id}.md" if aweme_id else f"{safe_title}.md"
+    filename = f"{safe_title}_{sid}.md" if sid else f"{safe_title}.md"
     output_path = output_dir / filename
-    output_path.write_text(fm + body, encoding="utf-8")
+    atomic_write_text(output_path, fm_io.dump_frontmatter(meta, body))
 
-    logger.info(f"笔记已生成: {output_path.name}")
+    logger.info("笔记已生成: %s", output_path.name)
     return output_path
 
 
-def _atomic_write_text(path: Path, content: str):
-    """
-    原子写入文本：先写同目录临时文件，再 os.replace 替换。
-    避免断点续转时 Ctrl+C / 进程崩溃导致原文件被截断。
-    百度同步盘可能锁定目标文件，失败时重试。
-    """
-    import time as _time
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    try:
-        tmp.write_text(content, encoding="utf-8")
-        # 同步盘可能锁定目标文件，重试几次
-        for attempt in range(5):
-            try:
-                os.replace(tmp, path)
-                return
-            except PermissionError:
-                if attempt < 4:
-                    _time.sleep(1)
-                else:
-                    raise
-    finally:
-        if tmp.exists():
-            try:
-                tmp.unlink()
-            except OSError:
-                pass
+# ── 回填转录 ──────────────────────────────────
 
 
-def update_transcript(note_path: Path, transcript: str):
+def update_transcript(note_path: Path, transcript: str) -> bool:
     """
-    将转录文本写入已有笔记，更新证据等级。
-    使用原子写：先写临时文件再 rename，避免断点续转时半截写入。
+    把转录文本写入已有笔记，并同步状态字段。
+
+    - 使用原子写，避免断点续转时半截写入
+    - **frontmatter 逐行更新（frontmatter.set_field），不整体重新序列化**，
+      因此笔记里的多行列表、嵌套字段、自定义字段都不会因为回填转录而丢失
+    - 重新计算 transcript_hash；转录内容变化时把 processing_status 置为
+      needs_review（旧摘要已失效，需要重新做 AI 知识处理）
     """
+    note_path = Path(note_path)
     if not note_path.exists():
-        return
+        logger.warning("笔记不存在，跳过回填: %s", note_path)
+        return False
 
-    content = note_path.read_text(encoding="utf-8")
+    text = fm_io.read_text(note_path)
+    if not text:
+        logger.warning("笔记读取失败，跳过回填: %s", note_path)
+        return False
 
-    section = f"## 📝 完整转写\n\n{transcript}\n" if transcript else "## 📝 完整转写\n\n_转录失败_\n"
-    content = content.replace("## 📝 完整转写\n\n_待转录..._", section)
-    content = content.replace("evidence_level: indexed", "evidence_level: transcript")
-    # 兼容老 status 取值：indexed / pending_* / failed 都应升级为 transcribed
-    content = re.sub(r"status:\s*\w+", "status: transcribed", content, count=1)
+    meta, _body = fm_io.parse_frontmatter(text)
 
-    _atomic_write_text(note_path, content)
+    new_hash = transcript_hash(transcript)
+    prev_summarized = str(meta.get("summarized_from_hash") or "").strip()
+
+    t_status = TRANSCRIPT_DONE if transcript else TRANSCRIPT_FAILED
+    p_status = str(meta.get("processing_status") or PROCESSING_PENDING)
+    if transcript and prev_summarized and prev_summarized != new_hash:
+        # 转录内容已变化 → 旧摘要失效，需要复核
+        if p_status == PROCESSING_DONE:
+            p_status = PROCESSING_NEEDS_REVIEW
+
+    updates = {
+        "evidence_level": "transcript" if transcript else "indexed",
+        "transcript_status": t_status,
+        "processing_status": p_status,
+        "transcript_hash": new_hash,
+        "status": legacy_status_of(t_status, p_status),
+    }
+
+    new_text = text
+    for key, value in updates.items():
+        new_text = fm_io.set_field(new_text, key, value)
+
+    content = transcript if transcript else "_转录失败_"
+    new_text = fm_io.replace_section(new_text, TRANSCRIPT_SECTION_HEADING, content)
+
+    atomic_write_text(note_path, new_text)
+    return True
+
+
+# ── 兼容旧接口 ────────────────────────────────
 
 
 def update_status(note_path: Path, status: str):
+    """
+    直接改写笔记状态（保留旧接口，测试与外部脚本仍可使用）。
+
+    会同时同步新的 transcript_status / processing_status 维度。
+    """
+    from .state import LEGACY_STATUS_MAP
+
+    note_path = Path(note_path)
     if not note_path.exists():
         return
-    content = note_path.read_text(encoding="utf-8")
-    content = re.sub(r"status: \w+", f"status: {status}", content)
-    note_path.write_text(content, encoding="utf-8")
+    updates = {"status": status}
+    mapped = LEGACY_STATUS_MAP.get(str(status).strip().lower())
+    if mapped:
+        updates["transcript_status"], updates["processing_status"] = mapped
+    fm_io.update_meta(note_path, updates)
+
+
+def mark_transcript_failed(note_path: Path, error: str = "") -> bool:
+    """
+    在笔记 frontmatter 标记转录失败。
+
+    - 只写状态，不把错误堆栈写进笔记正文（可诊断信息保存在数据库 last_error）
+    - frontmatter 逐行更新，不整体重写，避免丢失复杂 / 未知字段
+    - 转录失败绝不能被当成 pending 或 done
+    """
+    note_path = Path(note_path)
+    if not note_path.exists():
+        return False
+
+    text = fm_io.read_text(note_path)
+    if not text:
+        return False
+
+    meta, _body = fm_io.parse_frontmatter(text)
+    p_status = str(meta.get("processing_status") or PROCESSING_PENDING)
+
+    new_text = fm_io.set_field(text, "transcript_status", TRANSCRIPT_FAILED)
+    new_text = fm_io.set_field(new_text, "processing_status", p_status)
+    new_text = fm_io.set_field(
+        new_text, "status", legacy_status_of(TRANSCRIPT_FAILED, p_status)
+    )
+
+    if "_待转录..._" in new_text:
+        new_text = fm_io.replace_section(
+            new_text, TRANSCRIPT_SECTION_HEADING, "_转录失败_"
+        )
+
+    atomic_write_text(note_path, new_text)
+    return True

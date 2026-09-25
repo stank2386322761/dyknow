@@ -32,10 +32,15 @@ from .db import (
     STATUS_TRANSCRIBED, STATUS_FAILED,
 )
 from .login import load_cookies
-from .scraper import fetch as scrape_fetch
+from .scraper import fetch as scrape_fetch, search as scrape_search
 from .downloader import download, cleanup_video
 from .transcriber import extract_audio, transcribe, is_available as transcribe_available
-from .generator import generate_note, update_transcript
+from .generator import (
+    generate_note,
+    update_transcript,
+    mark_transcript_failed,
+)
+from .state import sanitize_error, transcript_hash
 
 logger = logging.getLogger("dyknow.syncer")
 
@@ -90,38 +95,10 @@ class Syncer:
                 return 0
 
             print(f"\n阶段1：生成 {len(items)} 条笔记...")
-            for i, item in enumerate(items, 1):
-                try:
-                    note_path = generate_note(
-                        title=item.title,
-                        aweme_id=item.aweme_id,
-                        author=item.author,
-                        author_id=item.author_id,
-                        duration=item.duration,
-                        likes=item.likes,
-                        comments=item.comments,
-                        shares=item.shares,
-                        plays=item.plays,
-                        cover_url=item.cover_url,
-                        transcript="",
-                    )
-                    self.db.insert(
-                        aweme_id=item.aweme_id,
-                        title=item.title,
-                        author=item.author,
-                        cover_url=item.cover_url,
-                        video_url=item.video_url,
-                        duration=item.duration,
-                        status=STATUS_PENDING_INDEX,
-                        note_path=str(note_path),
-                    )
-                    if i % 20 == 0:
-                        print(f"   [{i}/{len(items)}]")
-                except Exception as e:
-                    logger.error(f"生成笔记失败 ({item.aweme_id}): {e}")
+            added = self._index_items(items)
 
             total = self.db.total_count()
-            print(f"\n阶段1完成: 新增 {len(items)} 条，累计 {total} 条")
+            print(f"\n阶段1完成: 新增 {added} 条，累计 {total} 条")
             print(f"笔记目录: {config.output_dir}")
 
             if only_index or not transcribe:
@@ -134,6 +111,112 @@ class Syncer:
             logger.error(f"同步失败: {e}")
             traceback.print_exc()
             return 1
+
+    # ── 阶段1 辅助：落盘 + 入库 ─────────────────────
+
+    def _index_items(self, items, progress_every: int = 20) -> int:
+        """
+        把抓取到的条目落成元数据笔记并入库。
+
+        收藏同步（场景 B）与关键词搜索（场景 C）来源不同，
+        但「生成笔记 + 记录状态」这一步完全一致，因此共用本方法。
+        """
+        if not items:
+            return 0
+        added = 0
+        for i, item in enumerate(items, 1):
+            try:
+                note_path = generate_note(
+                    title=item.title,
+                    aweme_id=item.aweme_id,
+                    author=item.author,
+                    author_id=item.author_id,
+                    duration=item.duration,
+                    likes=item.likes,
+                    comments=item.comments,
+                    shares=item.shares,
+                    plays=item.plays,
+                    cover_url=item.cover_url,
+                    transcript="",
+                )
+                self.db.insert(
+                    aweme_id=item.aweme_id,
+                    title=item.title,
+                    author=item.author,
+                    cover_url=item.cover_url,
+                    video_url=item.video_url,
+                    duration=item.duration,
+                    status=STATUS_PENDING_INDEX,
+                    note_path=str(note_path),
+                )
+                added += 1
+                if progress_every and i % progress_every == 0:
+                    print(f"   [{i}/{len(items)}]")
+            except Exception as e:
+                logger.error(f"生成笔记失败 ({getattr(item, 'aweme_id', '?')}): {e}")
+        return added
+
+    def _ensure_login(self) -> bool:
+        """确保已登录，必要时走扫码流程"""
+        cookies = load_cookies()
+        if cookies:
+            return True
+        print("需要登录...")
+        from .login import login as do_login
+
+        cookies = asyncio.run(do_login())
+        return bool(cookies)
+
+    # ── 场景 C：关键词浏览 ─────────────────────────
+
+    def browse(
+        self,
+        keyword: str,
+        count: int = 30,
+        transcribe: bool = False,
+        full: bool = False,
+    ) -> int:
+        """按关键词搜索抖音内容并落成笔记（可选立即转录）"""
+        config.ensure_dirs()
+
+        if not self._ensure_login():
+            print("登录失败")
+            return 1
+
+        try:
+            items = asyncio.run(scrape_search(keyword, count=count))
+        except ValueError as e:
+            print(f"参数错误: {e}")
+            return 1
+        except RuntimeError as e:
+            print(f"{e}")
+            return 1
+        except Exception as e:
+            logger.error(f"搜索失败: {e}")
+            return 1
+
+        if not items:
+            print("未获取到任何视频")
+            return 1
+
+        if not full:
+            new_ids = set(self.db.get_new_ids([i.aweme_id for i in items]))
+            items = [i for i in items if i.aweme_id in new_ids]
+
+        if not items:
+            print("没有新内容，已是最新")
+            return 0
+
+        print(f"\n落盘 {len(items)} 条笔记...")
+        added = self._index_items(items)
+        print(f"\n完成: 新增 {added} 条，累计 {self.db.total_count()} 条")
+        print(f"笔记目录: {config.output_dir}")
+
+        if transcribe:
+            return self._phase2_transcribe()
+
+        print("\n提示: python -m dyknow transcribe 可转录语音（支持断点续转）")
+        return 0
 
     # ── 阶段2：转录（带断点续转） ─────────────────────
 
@@ -292,9 +375,7 @@ class Syncer:
 
                 # 无 video_url 无法继续
                 if not video_url:
-                    self.db.update_status(
-                        aweme_id, STATUS_FAILED, last_error="无 video_url"
-                    )
+                    self._mark_failed(aweme_id, note_path, "无 video_url")
                     failed += 1
                     log_line(f"[{i}/{len(pending)}] ❌ 无 video_url: {title}")
                     continue
@@ -326,7 +407,7 @@ class Syncer:
                 except Exception as e:
                     failed += 1
                     err = f"{type(e).__name__}: {e}"
-                    self.db.update_status(aweme_id, STATUS_FAILED, last_error=err)
+                    self._mark_failed(aweme_id, note_path, err)
                     log_line(f"[{i}/{len(pending)}] 💥 异常: {err}")
 
                 # 清理可能的视频缓存
@@ -379,9 +460,7 @@ class Syncer:
                 self.db.mark_attempt(aweme_id, STATUS_PENDING_DOWNLOAD)
                 video_path = download(video_url, aweme_id)
                 if not video_path:
-                    self.db.update_status(
-                        aweme_id, STATUS_FAILED, last_error="下载失败"
-                    )
+                    self._mark_failed(aweme_id, note_path, "下载失败")
                     return False, {"error": "下载失败"}
                 self.db.update_status(
                     aweme_id, STATUS_PENDING_DOWNLOAD,
@@ -397,17 +476,13 @@ class Syncer:
 
                 if not video_path or not video_path.exists():
                     # 视频缓存可能已被清理 → 退回 pending_download 重下
-                    self.db.update_status(
-                        aweme_id, STATUS_FAILED, last_error="视频缓存缺失，需重下"
-                    )
+                    self._mark_failed(aweme_id, note_path, "视频缓存缺失，需重下")
                     return False, {"error": "视频缓存缺失"}
 
                 self.db.mark_attempt(aweme_id, STATUS_PENDING_AUDIO)
                 audio_path = video_path.with_suffix(".wav")
                 if not extract_audio(video_path, audio_path):
-                    self.db.update_status(
-                        aweme_id, STATUS_FAILED, last_error="音频提取失败"
-                    )
+                    self._mark_failed(aweme_id, note_path, "音频提取失败")
                     return False, {"error": "音频提取失败"}
                 self.db.update_status(
                     aweme_id, STATUS_PENDING_AUDIO,
@@ -421,17 +496,13 @@ class Syncer:
                     audio_path = Path(audio_path_str) if audio_path_str else None
 
                 if not audio_path or not audio_path.exists():
-                    self.db.update_status(
-                        aweme_id, STATUS_FAILED, last_error="音频缓存缺失，需重抽"
-                    )
+                    self._mark_failed(aweme_id, note_path, "音频缓存缺失，需重抽")
                     return False, {"error": "音频缓存缺失"}
 
                 self.db.mark_attempt(aweme_id, STATUS_PENDING_TRANSCRIBE)
                 text = transcribe(audio_path)
                 if not text:
-                    self.db.update_status(
-                        aweme_id, STATUS_FAILED, last_error="转录结果为空"
-                    )
+                    self._mark_failed(aweme_id, note_path, "转录结果为空")
                     return False, {"error": "转录结果为空"}
 
                 # 写入笔记（原子写）
@@ -446,6 +517,7 @@ class Syncer:
 
                 self.db.update_status(
                     aweme_id, STATUS_TRANSCRIBED, last_error="",
+                    transcript_hash=transcript_hash(text),
                 )
                 return True, {"chars": len(text)}
 
@@ -453,8 +525,23 @@ class Syncer:
 
         except Exception as e:
             err = f"{type(e).__name__}: {e}"
-            self.db.update_status(aweme_id, STATUS_FAILED, last_error=err)
+            self._mark_failed(aweme_id, note_path, err)
             return False, {"error": err}
+
+    def _mark_failed(self, aweme_id: str, note_path: Optional[Path], error: str):
+        """
+        统一登记失败。
+
+        数据库保存可诊断信息（last_error），笔记标记 transcript_status: failed。
+        转录失败绝不能被误认为 pending 或 done。
+        """
+        err = sanitize_error(error)
+        self.db.update_status(aweme_id, STATUS_FAILED, last_error=err)
+        if note_path:
+            try:
+                mark_transcript_failed(note_path, err)
+            except Exception as e:
+                logger.warning(f"标记笔记失败状态出错 ({aweme_id}): {e}")
 
     def _get_video_path(self, aweme_id: str) -> Optional[str]:
         """从 db 取缓存的视频路径"""
