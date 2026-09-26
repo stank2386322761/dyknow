@@ -1487,6 +1487,95 @@ class TestConfigPersistence(BaseCase):
 
 
 # ═══════════════════════════════════════════════════════════════
+# G. reset 语义：必须清零 attempts
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestResetClearsAttempts(BaseCase):
+    """
+    回归测试。
+
+    reset 若不清零 attempts，此前累计到 --max-attempts 的条目在重跑时
+    会被逐条「已达 max_attempts，跳过」，整批静默无效，
+    但日志仍会打印「转录结束」，极难发现。
+    """
+
+    def _row(self, db, aweme_id):
+        return db.conn.execute(
+            "SELECT status, attempts, last_error, audio_path "
+            "FROM sync_log WHERE aweme_id = ?", (aweme_id,)
+        ).fetchone()
+
+    def test_reset_to_pending_index_clears_attempts(self):
+        from dyknow.db import get_db
+
+        db = get_db()
+        aweme_id = "8000000000000000001"
+        db.insert(aweme_id, title="reset 回归测试")
+        db.update_status(
+            aweme_id, "failed",
+            attempts=3, last_error="下载失败", audio_path="x.mp3",
+        )
+
+        db.reset_to_pending_index(aweme_id)
+
+        r = self._row(db, aweme_id)
+        self.assertEqual(r["status"], "pending_index")
+        self.assertEqual(
+            r["attempts"], 0,
+            "reset 必须清零 attempts，否则批量重跑会被静默跳过",
+        )
+        self.assertEqual(r["last_error"], "")
+        self.assertEqual(r["audio_path"], "")
+
+    def test_cleared_attempts_survive_max_attempts_gate(self):
+        """清零后不应再被 max_attempts 门槛拦住（模拟 get_pending_for_transcribe 的判定）"""
+        from dyknow.db import get_db
+
+        db = get_db()
+        aweme_id = "8000000000000000004"
+        db.insert(aweme_id, title="门槛测试")
+        db.update_status(aweme_id, "failed", attempts=3)
+
+        db.reset_to_pending_index(aweme_id)
+
+        r = self._row(db, aweme_id)
+        self.assertLess(r["attempts"], 3, "attempts 未清零，仍会被 max_attempts=3 跳过")
+
+    def test_reset_cli_ids_only_touches_given_subset(self):
+        """reset --ids 只重置指定条目，其余条目保持原状"""
+        from dyknow.db import get_db
+
+        db = get_db()
+        keep = "8000000000000000002"
+        hit = "8000000000000000003"
+        for i in (keep, hit):
+            db.insert(i, title="子集重置测试")
+            db.update_status(i, "failed", attempts=3, last_error="下载失败")
+
+        env = {
+            **os.environ,
+            "DYKNOW_DATA_DIR": str(self.tmp / "_data"),
+            "DYKNOW_OUTPUT_DIR": str(self.root),
+        }
+        r = subprocess.run(
+            [sys.executable, "-m", "dyknow", "reset", "--ids", hit, "--yes"],
+            cwd=str(PROJECT_ROOT), capture_output=True, timeout=60, env=env,
+        )
+        out = (r.stdout or b"").decode("utf-8", "replace")
+        self.assertIn("已重置", out, out)
+
+        hit_row = self._row(db, hit)
+        self.assertEqual(hit_row["status"], "pending_index")
+        self.assertEqual(hit_row["attempts"], 0)
+
+        keep_row = self._row(db, keep)
+        self.assertEqual(keep_row["status"], "failed", "未指定的条目不应被改动")
+        self.assertEqual(keep_row["attempts"], 3)
+
+
+# ═══════════════════════════════════════════════════════════════
+
 
 def run():
     loader = unittest.TestLoader()

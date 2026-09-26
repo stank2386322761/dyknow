@@ -68,7 +68,7 @@ macOS/Linux:  .venv/bin/python        -m dyknow <command>
 | `organize [--dry-run] [--migrate]` | 按分类安全移动笔记（场景 D） |
 | `index [--no-category-index]` | 全量重建知识库索引 |
 | `config [--set-output DIR]` | 查看 / 设置持久化配置（记住输出目录） |
-| `reset --target ...` / `night` | 重置任务 / 夜间批量转录 |
+| `reset [--target ...] [--ids ...]` / `night` | 重置任务 / 夜间批量转录 |
 
 `--output <目录>` 对 `parse`、`sync`、`transcribe`、`browse`、`index`、`organize`、`taxonomy` 均可用，只影响本次运行。
 

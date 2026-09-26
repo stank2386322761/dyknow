@@ -108,3 +108,6 @@ Windows 虚拟环境：`.venv/Scripts/python.exe -m dyknow <command>`；macOS/Li
 - 转录耗时步骤前必须提前告知用户，不要静默开始。
 - 模型永远不直接搬动文件，移动一律交给 `organize`。
 - 模型永远不手工维护索引，重建一律交给 `index`。
+- **批量重跑一律用 `reset`**：它现在会清零 `attempts`（早期版本不清零，会让重跑被静默跳过）。子集重跑用 `reset --ids`，不要自己改库。详见 SKILL.md 第 8.1 节。
+- **不要只看「转录结束」就宣布成功**：用 `status` 核对 `pending_index` 剩余数与实际成功数，把「成功/失败/跳过」三个数字都汇报给用户。
+- **换转录模型（tiny → small 等）后必须显式重跑**，旧转录不会自动失效；见 SKILL.md 第 8.2 / 8.3 节。

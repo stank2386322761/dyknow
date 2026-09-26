@@ -4,6 +4,7 @@ CLI 入口 —— DyKnow
 
 import argparse
 import asyncio
+import re
 import sys
 from pathlib import Path
 
@@ -65,10 +66,32 @@ def cmd_transcribe(args):
     )
 
 
+def _parse_ids_arg(raw: str) -> list[str]:
+    """
+    解析 reset --ids 的取值，返回 aweme_id 列表。
+
+    取值可以是逗号/空白分隔的 id 串，也可以是一个文件路径
+    （每行一个 id，允许 # 注释）。有了它，子集重跑不必再手工改数据库。
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return []
+    p = Path(raw)
+    if p.is_file():
+        items = []
+        for line in p.read_text(encoding="utf-8").splitlines():
+            line = line.split("#", 1)[0].strip()
+            if line:
+                items.append(line)
+        return items
+    return [x for x in re.split(r"[,\s]+", raw) if x]
+
+
 def cmd_reset(args):
     """
     把指定任务回退到 pending_index（强制重跑）。
     默认操作：把所有 status=transcribed 重置（重新转录）。
+    指定 --ids 时只重置这些 id，忽略 --target。
     """
     db = get_db()
     from .db import (
@@ -77,10 +100,28 @@ def cmd_reset(args):
     )
 
     target = args.target
-    if target == "transcribed":
+    ids = _parse_ids_arg(getattr(args, "ids", "") or "")
+
+    if ids:
+        placeholders = ",".join("?" * len(ids))
+        existing = {
+            r["aweme_id"]
+            for r in db.conn.execute(
+                f"SELECT aweme_id FROM sync_log WHERE aweme_id IN ({placeholders})",
+                tuple(ids),
+            ).fetchall()
+        }
+        missing = [i for i in ids if i not in existing]
+        if missing:
+            print(f"⚠️  数据库中不存在、已忽略 {len(missing)} 个 id: {', '.join(missing[:10])}")
+        rows = [{"aweme_id": i} for i in ids if i in existing]
+        scope = f"指定的 {len(rows)} 条"
+    elif target == "transcribed":
         rows = db.get_by_status(STATUS_TRANSCRIBED)
+        scope = f"{target} 状态的 {len(rows)} 条"
     elif target == "failed":
         rows = db.get_by_status(STATUS_FAILED)
+        scope = f"{target} 状态的 {len(rows)} 条"
     elif target == "all":
         placeholders = ",".join("?" * len(TRANSCRIBE_PIPELINE_STATUSES))
         rows = db.conn.execute(
@@ -88,23 +129,24 @@ def cmd_reset(args):
             tuple(TRANSCRIBE_PIPELINE_STATUSES),
         ).fetchall()
         rows = [dict(r) for r in rows]
+        scope = f"{target} 状态的 {len(rows)} 条"
     else:
         print(f"未知 target: {target}")
         return 1
 
     if not rows:
-        print(f"没有 {target} 状态的任务")
+        print("没有匹配的任务")
         return 0
 
     if not args.yes:
-        ans = input(f"将重置 {len(rows)} 条任务到 pending_index，确认？(y/N): ")
+        ans = input(f"将重置 {scope} 到 pending_index（同时清零 attempts），确认？(y/N): ")
         if ans.strip().lower() != "y":
             print("已取消")
             return 0
 
     for r in rows:
         db.reset_to_pending_index(r["aweme_id"])
-    print(f"✅ 已重置 {len(rows)} 条到 pending_index")
+    print(f"✅ 已重置 {len(rows)} 条到 pending_index（attempts 已清零）")
     return 0
 
 
@@ -393,7 +435,12 @@ def main():
         "--target",
         choices=["transcribed", "failed", "all"],
         default="transcribed",
-        help="重置哪类任务（默认 transcribed）",
+        help="重置哪类任务（默认 transcribed）；指定 --ids 时该项被忽略",
+    )
+    rp.add_argument(
+        "--ids",
+        default="",
+        help="只重置这些 aweme_id：逗号/空白分隔，或一个每行一个 id 的文件路径",
     )
     rp.add_argument("--yes", "-y", action="store_true", help="跳过确认")
 

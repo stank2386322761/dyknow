@@ -292,10 +292,16 @@ class SyncDB:
         return row["cnt"] if row else 0
 
     def reset_to_pending_index(self, aweme_id: str):
-        """把一条记录重置为 pending_index（用于重跑）"""
+        """
+        把一条记录重置为 pending_index（用于重跑）。
+
+        注意：必须同时把 attempts 清零。否则条目此前若已累计到 --max-attempts，
+        重跑时会被逐条「已达 max_attempts，跳过」，整批实际什么都不做，
+        但日志仍会打印「转录结束」，极难发现。
+        """
         self.update_status(
             aweme_id, STATUS_PENDING_INDEX,
-            last_error="", audio_path="",
+            last_error="", audio_path="", attempts=0,
         )
 
     # ── v2：知识处理维度 ──────────────────────────

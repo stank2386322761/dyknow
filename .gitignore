@@ -9,6 +9,10 @@ data/transcribe_progress.json
 data/night_pid.txt
 data/config.json
 
+# ── 运维临时产物（备份 / 中间清单） ──
+data/_backup_*/
+data/_*.json
+
 # ── 用户收藏内容 ──
 抖音收藏/
 

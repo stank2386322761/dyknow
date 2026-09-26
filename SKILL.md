@@ -109,11 +109,66 @@ description: 把抖音视频批量转成可检索的本地 Markdown 知识库。
 | `organize [--dry-run] [--migrate]` | 按分类安全移动笔记 | D |
 | `index` | 全量重建知识库索引 | D |
 | `config [--set-output DIR]` | 查看 / 设置持久化配置（记住输出目录） | 首次 |
-| `reset --target ...` / `night` | 重置任务 / 夜间批量转录 | 运维 |
+| `reset [--target ...] [--ids ...]` / `night` | 重置任务（会清零 attempts）/ 夜间批量转录 | 运维 |
 
 说明：虚拟环境解释器 Windows 为 `.venv/Scripts/python.exe`，macOS/Linux 为 `.venv/bin/python`，README 有完整说明。
 
-## 8. 职责边界
+## 8. 运维已知坑（重跑/升级模型前必读）
+
+### 8.1 批量重跑一律用 `reset`，不要自己改库
+
+`reset` 现在会把 `attempts` 一并清零（早期版本不清零：条目累计到 `--max-attempts` 后重跑会被逐条「已达 max_attempts，跳过」，整批静默无效，但日志仍打印「转录结束」——已修复，`tests/test_v2.py::TestResetClearsAttempts` 有回归测试）。
+
+```bash
+# 整类重跑
+python -m dyknow reset --target failed --yes
+
+# 只重跑指定子集（逗号分隔，或一个每行一个 id 的文件）
+python -m dyknow reset --ids 7683518524770701219,7667531563621515634 --yes
+python -m dyknow reset --ids data/targets.txt --yes
+```
+
+跑完不要只看「转录结束」，用 `python -m dyknow status` 核对 `pending_index` 剩余数与实际成功数。
+
+### 8.2 模型精度决定知识库质量上限
+
+- 默认 `data/models/ggml-tiny.bin`（74MB）精度最低，ASR 错字严重，例：「我自媒体制两年长了100万的粉丝」＝「做自媒体两年涨了100万粉丝」。
+- 升级：把 `ggml-small.bin`（465MB）放进 `data/models/`，用环境变量切换（需绝对路径）：
+
+```bash
+DYKNOW_GGML_MODEL="X:/.../data/models/ggml-small.bin" .venv/Scripts/python.exe -m dyknow transcribe
+```
+
+- 国内 HuggingFace 不通，用镜像 `https://hf-mirror.com/ggerganov/whisper.cpp/resolve/main/ggml-small.bin`。
+- small 比 tiny 慢约 2–15 倍（随视频长度，单条约 17s–440s）。批量规划按「分钟级/条」估算。
+- 转录输出可能是**繁体中文**，属正常现象。
+
+### 8.3 升级模型后必须显式重跑转录
+
+旧转录文本不会自动失效：需先把目标条目重置为 `pending_index`（见 8.1）。
+转录变化会让 `transcript_hash` 失配，`summarized_from_hash` 已对齐的旧摘要随即被判定需重做。
+
+### 8.4 抖音下载失败多为临时限流
+
+连续下载几百条后容易出现整批 `last_error: 下载失败`，通常过一段时间自行恢复。
+遇到时先小批量探针（`transcribe --count 3`）确认链路，再放全量；不要连续猛冲。
+登录态用 `status` 确认，显示「已登录」不代表下载没被限流。
+
+### 8.5 转录正文是单行超长文本
+
+`## 📝 完整转写` 正文常是一整行（可达 1.8 万字符），直接读会被截断，必须先按宽度折行：
+
+```python
+import textwrap; print(textwrap.fill(body, 100))
+```
+
+### 8.6 重转录会冲掉已写好的摘要
+
+已归档、`processing_status: done` 且 `summarized_from_hash` 对齐的笔记，一旦重转即丢摘要。
+**只重转「未处理」里的条目**；要升级已归档条目，先确认可以接受摘要重写。
+
+## 9. 职责边界
+
 
 **程序负责（不要用 AI 手工替代）**：
 
