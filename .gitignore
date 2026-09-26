@@ -7,6 +7,7 @@ data/wheels/
 data/*.log
 data/transcribe_progress.json
 data/night_pid.txt
+data/config.json
 
 # ── 用户收藏内容 ──
 抖音收藏/

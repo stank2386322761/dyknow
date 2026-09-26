@@ -34,7 +34,10 @@ python scripts/check_env.py
 # 4. 扫码登录（Cookie 持久化）
 python -m dyknow login
 
-# 5. 开始使用
+# 5. 设置笔记输出目录（只需一次，之后长期记住）
+python -m dyknow config --set-output "X:/path/to/你的知识库"
+
+# 6. 开始使用
 python -m dyknow parse "7.64 ... https://v.douyin.com/xxx/ ..."   # 单视频
 python -m dyknow sync                                            # 同步收藏
 python -m dyknow transcribe                                      # 批量转录
@@ -64,10 +67,36 @@ macOS/Linux:  .venv/bin/python        -m dyknow <command>
 | `browse -k "关键词" [--count N] [--transcribe]` | 关键词浏览（场景 C） |
 | `organize [--dry-run] [--migrate]` | 按分类安全移动笔记（场景 D） |
 | `index [--no-category-index]` | 全量重建知识库索引 |
+| `config [--set-output DIR]` | 查看 / 设置持久化配置（记住输出目录） |
 | `reset --target ...` / `night` | 重置任务 / 夜间批量转录 |
 
-`organize` / `index` / `taxonomy` 支持 `--output <知识库根目录>`；
-也可用环境变量 `DYKNOW_OUTPUT_DIR`。
+`--output <目录>` 对 `parse`、`sync`、`transcribe`、`browse`、`index`、`organize`、`taxonomy` 均可用，只影响本次运行。
+
+## 配置
+
+首次使用时设置一次笔记输出目录，之后长期记住：
+
+```bash
+python -m dyknow config --set-output "X:/path/to/你的知识库"
+python -m dyknow config      # 查看当前配置与目录来源
+```
+
+输出目录解析优先级（高 → 低）：
+
+```text
+--output 参数  >  DYKNOW_OUTPUT_DIR 环境变量  >  data/config.json  >  <运行目录>/抖音收藏
+```
+
+`data/config.json` 位于数据目录内，而 `data/` 已被 `.gitignore` 忽略，不会进入版本库。
+
+### 环境变量
+
+| 变量 | 作用 |
+|---|---|
+| `DYKNOW_OUTPUT_DIR` | 笔记输出目录（优先级高于配置文件，适合临时切换） |
+| `DYKNOW_DATA_DIR` | 数据目录（Cookie / 数据库 / 模型 / 配置文件） |
+| `DYKNOW_GGML_MODEL` | 转录模型路径（默认 `data/models/ggml-tiny.bin`） |
+| `DYKNOW_KEEP_MEDIA_CACHE` | 设为 `1` / `true` / `yes` 时保留视频与音频缓存，不自动删除 |
 
 ## 目录语义
 

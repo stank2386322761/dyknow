@@ -29,9 +29,19 @@ description: 把抖音视频批量转成可检索的本地 Markdown 知识库。
 第一次使用时应先确认笔记输出位置：
 
 1. 询问用户「笔记文件保存在哪个目录？」
-2. 用户未指定时，默认使用运行目录下的 `抖音收藏/`
-3. 确认后告知用户目录结构，并确保目录存在
-4. 后续所有操作都使用该目录（通过 `DYKNOW_OUTPUT_DIR` 环境变量或 `--output` 传入）
+2. 用户给出目录后，**写入配置让它长期记住**：
+   `python -m dyknow config --set-output "<目录>"`
+3. 用户未指定时，默认使用运行目录下的 `抖音收藏/`
+4. 确认后告知用户目录结构，并确保目录存在
+5. 之后每次运行都会自动读取已保存的目录，不必重复询问
+
+输出目录解析优先级（高 → 低）：
+
+```text
+--output 参数  >  DYKNOW_OUTPUT_DIR 环境变量  >  data/config.json  >  <运行目录>/抖音收藏
+```
+
+随时查看当前生效的目录及其来源：`python -m dyknow config`
 
 知识库目录结构：
 
@@ -98,6 +108,7 @@ description: 把抖音视频批量转成可检索的本地 Markdown 知识库。
 | `browse -k "关键词" [--count N] [--transcribe]` | 关键词浏览 | C |
 | `organize [--dry-run] [--migrate]` | 按分类安全移动笔记 | D |
 | `index` | 全量重建知识库索引 | D |
+| `config [--set-output DIR]` | 查看 / 设置持久化配置（记住输出目录） | 首次 |
 | `reset --target ...` / `night` | 重置任务 / 夜间批量转录 | 运维 |
 
 说明：虚拟环境解释器 Windows 为 `.venv/Scripts/python.exe`，macOS/Linux 为 `.venv/bin/python`，README 有完整说明。

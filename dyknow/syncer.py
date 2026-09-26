@@ -49,6 +49,7 @@ class Syncer:
 
     def __init__(self):
         self.db: SyncDB = get_db()
+        self._keep_cache = bool(getattr(config, "keep_media_cache", False))
 
     # ── 阶段1：同步元数据 ──────────────────────────
 
@@ -358,6 +359,12 @@ class Syncer:
 
                 save_progress(i, aweme_id, success, failed, skipped)
 
+                # 随机休息，降低被限流概率（DYKNOW_TRANSCRIBE_DELAY=0 时关闭）
+                _delay = getattr(config, "transcribe_delay", 0.0) or 0.0
+                if _delay > 0:
+                    import random as _random
+                    time.sleep(_random.uniform(0, _delay))
+
                 # 跳过已完成的
                 if current_status == STATUS_TRANSCRIBED:
                     skipped += 1
@@ -509,11 +516,12 @@ class Syncer:
                 if note_path and note_path.exists():
                     update_transcript(note_path, text)
 
-                # 清理音频缓存
-                try:
-                    audio_path.unlink(missing_ok=True)
-                except Exception:
-                    pass
+                # 清理音频缓存（DYKNOW_KEEP_MEDIA_CACHE=1 时保留）
+                if not self._keep_cache:
+                    try:
+                        audio_path.unlink(missing_ok=True)
+                    except Exception:
+                        pass
 
                 self.db.update_status(
                     aweme_id, STATUS_TRANSCRIBED, last_error="",

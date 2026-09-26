@@ -5,5 +5,10 @@
 cd "$(dirname "$0")/.." || exit 1
 
 echo "🌙 夜间转录启动 — $(date '+%Y-%m-%d %H:%M:%S')"
-.venv/Scripts/python.exe -m dyknow night --start 18:30 --end 08:30 --max-attempts 3
+if [ -f ".venv/Scripts/python.exe" ]; then
+    PY=".venv/Scripts/python.exe"
+else
+    PY=".venv/bin/python"
+fi
+"$PY" -m dyknow night --start 18:30 --end 08:30 --max-attempts 3
 echo "🏁 夜间转录结束 — $(date '+%Y-%m-%d %H:%M:%S')"

@@ -1,9 +1,15 @@
 """
 运行 DyKnow 全部测试
 
-用法:
-    .venv/Scripts/python.exe tests/run_all.py
-    .venv/Scripts/python.exe -m pytest tests/ -v
+用法（在项目根目录执行，解释器按平台选择）:
+
+    Windows:      .venv/Scripts/python.exe tests/run_all.py
+    macOS/Linux:  .venv/bin/python        tests/run_all.py
+
+或直接用当前环境的 python:
+
+    python tests/run_all.py
+    python -m pytest tests/ -v
 """
 
 import sys

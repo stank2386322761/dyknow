@@ -89,7 +89,9 @@ def download(url: str, aweme_id: str, max_retries: int = 3) -> Path | None:
 
 
 def cleanup_video(aweme_id: str):
-    """删除缓存的视频文件"""
+    """删除缓存的视频文件（DYKNOW_KEEP_MEDIA_CACHE=1 时跳过）"""
+    if config.keep_media_cache:
+        return
     video_path = config.video_cache_dir / f"{aweme_id}.mp4"
     if video_path.exists():
         video_path.unlink()

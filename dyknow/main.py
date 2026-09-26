@@ -25,6 +25,7 @@ def cmd_status(_args):
     print("=" * 50)
     print(f"登录: {'已登录' if load_cookies() else '未登录'}")
     print(f"笔记目录: {config.output_dir}")
+    print(f"           （来源：{config.output_dir_source()}）")
     print(f"数据库:   {config.db_path}")
     print()
     print("转录流水线状态:")
@@ -44,6 +45,7 @@ def cmd_status(_args):
 
 def cmd_sync(args):
     from .syncer import Syncer
+    _apply_output(args)
     return Syncer().sync(
         count=args.count,
         only_index=args.only_index,
@@ -55,6 +57,7 @@ def cmd_sync(args):
 
 def cmd_transcribe(args):
     from .syncer import Syncer
+    _apply_output(args)
     return Syncer()._phase2_transcribe(
         count=args.count,
         include_failed=args.retry_failed,
@@ -135,6 +138,7 @@ def cmd_parse(args):
 
 def cmd_browse(args):
     from .syncer import Syncer
+    _apply_output(args)
     return Syncer().browse(
         keyword=args.keyword,
         count=args.count,
@@ -143,12 +147,63 @@ def cmd_browse(args):
     )
 
 
+def _apply_output(args) -> None:
+    """
+    把 `--output` 应用到全局配置（运行时覆盖，不写盘）。
+
+    用于 sync / transcribe / browse 这类「根目录不是返回值」的命令。
+    """
+    raw = getattr(args, "output", None)
+    if raw:
+        config.output_dir = Path(raw).expanduser().resolve()
+
+
 def _resolve_output(args) -> Path:
-    """确定知识库根目录：命令行 --output 优先，其次配置（含环境变量）"""
+    """确定知识库根目录：命令行 --output 优先，其次配置（环境变量 → 配置文件 → 默认）"""
     raw = getattr(args, "output", None)
     if raw:
         return Path(raw).expanduser()
     return config.output_dir
+
+
+def cmd_config(args):
+    """
+    查看 / 设置持久化配置。
+
+    首次使用时用 `config --set-output <目录>` 记住笔记输出目录，
+    之后每次运行都会自动读取，不必重复指定。
+    """
+    if args.set_output:
+        target = config.save_output_dir(args.set_output)
+        print("\n已保存笔记输出目录")
+        print("=" * 50)
+        print(f"  目录    : {target}")
+        print(f"  配置文件: {config.config_path}")
+        print("\n之后的运行都会使用该目录。")
+        print("如需临时切换：加 --output <目录>，或设 DYKNOW_OUTPUT_DIR 环境变量。")
+        return 0
+
+    print("\nDyKnow 配置")
+    print("=" * 50)
+    print(f"  配置文件    : {config.config_path}")
+    status = "已存在" if config.config_path.exists() else "尚未创建（执行 config --set-output 时生成）"
+    print(f"  配置状态    : {status}")
+    print(f"  数据目录    : {config.data_dir}")
+    print(f"  笔记输出目录: {config.output_dir}")
+    print(f"  目录来源    : {config.output_dir_source()}")
+    print(f"  转录模型    : {config.ggml_model_path}")
+    print(f"  保留媒体缓存: {config.keep_media_cache}")
+
+    saved = config.read_config_file()
+    if saved:
+        print()
+        print("  配置文件内容:")
+        for k, v in saved.items():
+            print(f"    {k}: {v}")
+
+    print()
+    print('  设置输出目录: python -m dyknow config --set-output "<目录>"')
+    return 0
 
 
 def _rel(path: Path, root: Path) -> str:
@@ -292,6 +347,8 @@ def main():
   dyknow organize --dry-run       预览归档计划
   dyknow organize                 按分类归档
   dyknow index                    全量重建索引
+  dyknow config                   查看当前配置与输出目录来源
+  dyknow config --set-output "<目录>"   记住笔记输出目录（首次使用）
   dyknow reset --target transcribed --yes  把已转录项全部重置
         """,
     )
@@ -306,6 +363,7 @@ def main():
     sp.add_argument("--only-transcribe", action="store_true")
     sp.add_argument("--transcribe", action="store_true")
     sp.add_argument("--full", action="store_true")
+    sp.add_argument("--output", default=None, help="笔记输出目录（本次运行覆盖配置）")
 
     # 单独的 transcribe 子命令（断点续转主入口）
     tp = sub.add_parser(
@@ -324,6 +382,7 @@ def main():
         "--max-attempts", type=int, default=3,
         help="单条任务最大尝试次数，超过则跳过（默认 3）",
     )
+    tp.add_argument("--output", default=None, help="笔记输出目录（本次运行覆盖配置）")
 
     # reset 子命令
     rp = sub.add_parser(
@@ -358,6 +417,14 @@ def main():
     bp.add_argument("--count", type=int, default=30, help="目标条数（默认 30）")
     bp.add_argument("--transcribe", action="store_true", help="同时下载并转录")
     bp.add_argument("--full", action="store_true", help="包含已同步过的内容")
+    bp.add_argument("--output", default=None, help="笔记输出目录（本次运行覆盖配置）")
+
+    # config：查看 / 设置持久化配置
+    cp = sub.add_parser("config", help="查看或设置持久化配置（首次用来记住输出目录）")
+    cp.add_argument(
+        "--set-output", metavar="DIR", default=None,
+        help="把笔记输出目录写入配置文件，之后长期生效",
+    )
 
     # index：全量重建索引
     ip = sub.add_parser("index", help="全量重建知识库索引")
@@ -399,6 +466,7 @@ def main():
         "index": cmd_index,
         "organize": cmd_organize,
         "taxonomy": cmd_taxonomy,
+        "config": cmd_config,
     }
     handler = handlers.get(args.command)
     return handler(args) if handler else 1

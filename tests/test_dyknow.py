@@ -1,10 +1,14 @@
 """
 DyKnow 完整测试套件
 
-运行:
-    cd DyKnow项目目录
-    .venv/Scripts/python.exe tests/test_dyknow.py
-    .venv/Scripts/python.exe -m pytest tests/test_dyknow.py -v
+运行（在项目根目录执行，解释器按平台选择）:
+
+    Windows:      .venv/Scripts/python.exe tests/test_dyknow.py
+    macOS/Linux:  .venv/bin/python        tests/test_dyknow.py
+
+或统一使用一键入口:
+
+    python tests/run_all.py
 """
 
 import os

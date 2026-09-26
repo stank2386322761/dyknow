@@ -9,9 +9,14 @@ DyKnow v2 测试套件
     E. 文件冲突（不同 source_id 同标题不互相覆盖）
     F. 兼容性（旧笔记可读、核心路径未失效）
 
-运行:
-    .venv/Scripts/python.exe -m pytest tests/test_v2.py -v
-    .venv/Scripts/python.exe tests/run_all.py
+运行（在项目根目录执行，解释器按平台选择）:
+
+    Windows:      .venv/Scripts/python.exe tests/test_v2.py
+    macOS/Linux:  .venv/bin/python        tests/test_v2.py
+
+或统一使用一键入口:
+
+    python tests/run_all.py
 """
 
 import os
@@ -1336,6 +1341,149 @@ class TestSourceIdStrictness(BaseCase):
 
         self.assertTrue(is_video_note({"platform": "douyin"}))
         self.assertTrue(is_video_note({"platform": "Douyin"}))
+
+
+# ═══════════════════════════════════════════════════════════════
+# L. 输出目录持久化（v2.3：首次确认一次，后续记住）
+# ═══════════════════════════════════════════════════════════════
+
+
+class TestConfigPersistence(BaseCase):
+    """输出目录优先级：--output > DYKNOW_OUTPUT_DIR > data/config.json > cwd/抖音收藏"""
+
+    def _cfg(self, data_dir=None):
+        from dyknow.config import Config
+
+        return Config(data_dir=data_dir or (self.tmp / "_data_cfg"))
+
+    def test_save_then_reload(self):
+        """保存后重新实例化仍能读到（等价于「下次运行自动记住」）"""
+        target = self.tmp / "我的知识库"
+        cfg = self._cfg()
+        saved = cfg.save_output_dir(target)
+
+        self.assertEqual(saved, target)
+        self.assertTrue(cfg.config_path.exists())
+
+        fresh = self._cfg()
+        self.assertEqual(fresh.output_dir, target)
+        self.assertIn("配置文件", fresh.output_dir_source())
+
+    def test_relative_path_becomes_absolute(self):
+        """相对路径按 cwd 展开为绝对路径，避免日后 cwd 变化导致漂移"""
+        cfg = self._cfg()
+        saved = cfg.save_output_dir("./相对知识库")
+        self.assertTrue(saved.is_absolute())
+        self.assertEqual(self._cfg().output_dir, saved)
+
+    def test_runtime_override_wins_and_does_not_persist(self):
+        cfg = self._cfg()
+        cfg.save_output_dir(self.tmp / "保存的目录")
+
+        override = self.tmp / "临时目录"
+        cfg.output_dir = override
+        self.assertEqual(cfg.output_dir, override)
+        self.assertIn("运行时覆盖", cfg.output_dir_source())
+
+        # 清除覆盖后回到配置文件里的值（说明覆盖没有写盘）
+        cfg.output_dir = None
+        self.assertEqual(cfg.output_dir, self.tmp / "保存的目录")
+
+    def test_env_beats_config_file(self):
+        from unittest import mock
+
+        cfg = self._cfg()
+        cfg.save_output_dir(self.tmp / "保存的目录")
+        env_dir = self.tmp / "环境变量目录"
+
+        with mock.patch.dict(os.environ, {"DYKNOW_OUTPUT_DIR": str(env_dir)}):
+            self.assertEqual(cfg.output_dir, env_dir)
+            self.assertIn("环境变量", cfg.output_dir_source())
+
+    def test_config_file_beats_cwd_default(self):
+        from unittest import mock
+
+        cfg = self._cfg()
+        target = self.tmp / "保存的目录"
+        cfg.save_output_dir(target)
+
+        with mock.patch.dict(os.environ, {"DYKNOW_OUTPUT_DIR": ""}):
+            self.assertEqual(cfg.output_dir, target)
+
+    def test_corrupt_config_file_falls_back(self):
+        """配置文件损坏时不得崩溃，应回退到默认值"""
+        from unittest import mock
+
+        cfg = self._cfg()
+        cfg.data_dir.mkdir(parents=True, exist_ok=True)
+        cfg.config_path.write_text("{ 这不是合法 json", encoding="utf-8")
+
+        self.assertEqual(cfg.read_config_file(), {})
+        with mock.patch.dict(os.environ, {"DYKNOW_OUTPUT_DIR": ""}):
+            self.assertEqual(cfg.output_dir, Path.cwd() / "抖音收藏")
+            self.assertIn("默认值", cfg.output_dir_source())
+
+    def test_save_preserves_other_keys(self):
+        """写入输出目录不得覆盖配置文件里的其他键"""
+        cfg = self._cfg()
+        cfg.data_dir.mkdir(parents=True, exist_ok=True)
+        cfg.config_path.write_text('{"other": "keep"}\n', encoding="utf-8")
+
+        cfg.save_output_dir(self.tmp / "目录")
+
+        data = cfg.read_config_file()
+        self.assertEqual(data.get("other"), "keep")
+        self.assertIn("output_dir", data)
+
+    def test_cli_config_set_output_roundtrip(self):
+        """CLI 真实执行：设置后再查询应显示该目录"""
+        data_dir = self.tmp / "_data_cli"
+        target = self.tmp / "CLI知识库"
+        env = dict(os.environ, DYKNOW_DATA_DIR=str(data_dir))
+        env.pop("DYKNOW_OUTPUT_DIR", None)
+
+        r = subprocess.run(
+            [sys.executable, "-m", "dyknow", "config", "--set-output", str(target)],
+            cwd=str(PROJECT_ROOT), capture_output=True, timeout=60, env=env,
+        )
+        self.assertEqual(r.returncode, 0, r.stderr.decode("utf-8", "replace"))
+        self.assertTrue((data_dir / "config.json").exists())
+
+        r2 = subprocess.run(
+            [sys.executable, "-m", "dyknow", "config"],
+            cwd=str(PROJECT_ROOT), capture_output=True, timeout=60, env=env,
+        )
+        out = (r2.stdout or b"").decode("utf-8", "replace")
+        self.assertIn(str(target), out)
+
+    def test_output_dir_flows_into_generated_note(self):
+        """配置文件里的目录真的会成为笔记落盘位置"""
+        from unittest import mock
+
+        from dyknow import config as cfg_mod
+        from dyknow.generator import generate_note
+
+        target = self.tmp / "持久化知识库"
+        cfg_mod.config.data_dir = self.tmp / "_data_flow"
+        # 清除 setUp 里设置的运行时覆盖，让配置文件成为实际生效来源
+        cfg_mod.config.output_dir = None
+        cfg_mod.config.save_output_dir(target)
+
+        with mock.patch.dict(os.environ, {"DYKNOW_OUTPUT_DIR": ""}):
+            p = generate_note(title="落盘位置测试", aweme_id="9000000000000000001")
+
+        self.assertTrue(str(p).startswith(str(target)), p)
+        self.assertTrue(p.exists())
+
+    def test_sync_transcribe_browse_accept_output_flag(self):
+        """sync / transcribe / browse 现在都可接受 --output（此前只能靠环境变量）"""
+        for cmd in ("sync", "transcribe", "browse"):
+            r = subprocess.run(
+                [sys.executable, "-m", "dyknow", cmd, "--help"],
+                cwd=str(PROJECT_ROOT), capture_output=True, timeout=60,
+            )
+            out = (r.stdout or b"").decode("utf-8", "replace")
+            self.assertIn("--output", out, f"{cmd} 缺少 --output")
 
 
 # ═══════════════════════════════════════════════════════════════
