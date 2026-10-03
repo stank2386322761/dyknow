@@ -11,7 +11,7 @@
 第 3 条是本模块的核心：SKILL.md 要求「首次确认一次输出目录，后续都用它」，
 仅靠环境变量做不到跨会话记住，因此提供最小的持久化配置文件。
 
-配置文件放在 data_dir 下，而 `data/` 已在 .gitignore 中，不会进入版本库。
+配置文件放在 data_dir 下；Git 工作树默认共用主项目 data，敏感文件由 .gitignore 排除。
 """
 
 import json
@@ -22,14 +22,32 @@ from pathlib import Path
 CONFIG_FILENAME = "config.json"
 
 
+def default_data_dir(project_root: Path | None = None) -> Path:
+    """Git 工作树共享主仓库 data；普通目录仍使用本项目 data。"""
+    override = os.environ.get("DYKNOW_DATA_DIR", "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    root = project_root or Path(__file__).resolve().parent.parent
+    marker = root / ".git"
+    if marker.is_file():
+        try:
+            value = marker.read_text(encoding="utf-8").strip()
+            if value.startswith("gitdir:"):
+                git_dir = (root / value.split(":", 1)[1].strip()).resolve()
+                common = (git_dir / (git_dir / "commondir").read_text(encoding="utf-8").strip()).resolve()
+                if common.name == ".git":
+                    return common.parent / "data"
+        except (OSError, ValueError):
+            pass
+    return root / "data"
+
+
 @dataclass
 class Config:
     """全局配置，支持环境变量与配置文件覆盖"""
 
     # 数据目录（cookie、数据库、视频缓存、配置文件）
-    data_dir: Path = field(default_factory=lambda: Path(
-        os.environ.get("DYKNOW_DATA_DIR", Path(__file__).parent.parent / "data")
-    ))
+    data_dir: Path = field(default_factory=default_data_dir)
 
     # 默认同步数量
     default_count: int = 200
@@ -53,13 +71,13 @@ class Config:
 
     # 转录模型 — pywhispercpp (whisper.cpp GGML)
     # 默认使用 ggml-tiny.bin (74MB)，可切换为 ggml-small.bin (465MB)
-    ggml_model_path: str = os.environ.get(
-        "DYKNOW_GGML_MODEL",
-        str(Path(__file__).parent.parent / "data" / "models" / "ggml-tiny.bin"),
-    )
+    ggml_model_path: str = field(default_factory=lambda: os.environ.get("DYKNOW_GGML_MODEL", ""))
 
     def __post_init__(self):
         # 运行时覆盖（--output）。不作为 dataclass 字段，避免污染 __init__ 签名。
+        self.data_dir = Path(self.data_dir)
+        if not self.ggml_model_path:
+            self.ggml_model_path = str(self.data_dir / "models" / "ggml-tiny.bin")
         self._output_override: Path | None = None
 
     # ── 派生路径 ──────────────────────────────

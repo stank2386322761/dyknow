@@ -74,7 +74,7 @@ def strip_prefix(name: str) -> str:
 
 @dataclass
 class Category:
-    """一个分类（可含一层子分类）"""
+    """一个分类（可递归包含子分类）"""
 
     name: str
     aliases: list[str] = field(default_factory=list)
@@ -176,18 +176,20 @@ class Taxonomy:
 
     def _rebuild_index(self):
         index: dict[str, str] = {}
-        for top in self.categories:
-            if not top.name:
-                continue
-            for key in self._keys_for(top.name, top.name, top.aliases):
-                index[key] = top.name
-            for child in top.children:
-                if not child.name:
-                    continue
-                path = f"{top.name}{SEPARATOR}{child.name}"
-                for key in self._keys_for(child.name, path, child.aliases):
-                    index[key] = path
+        for path, category in self._walk():
+            for key in self._keys_for(category.name, path, category.aliases):
+                index[key] = path
         self._index = index
+
+    def _walk(self):
+        def walk(categories, parent=""):
+            for category in categories:
+                if not category.name:
+                    continue
+                path = f"{parent}{SEPARATOR}{category.name}" if parent else category.name
+                yield path, category
+                yield from walk(category.children, path)
+        yield from walk(self.categories)
 
     @staticmethod
     def _keys_for(name: str, canonical: str, aliases: list[str] | None = None) -> list[str]:
@@ -198,7 +200,7 @@ class Taxonomy:
         以及「父类去前缀 + 子类名」的扁平写法。
         """
         keys: list[str] = []
-        values = [name, strip_prefix(name)]
+        values = [canonical, name, strip_prefix(name)]
         values.extend(str(a) for a in (aliases or []))
 
         parent_prefix = ""
@@ -230,14 +232,7 @@ class Taxonomy:
 
     def all_paths(self) -> list[str]:
         """全部规范分类路径（含子分类）"""
-        out: list[str] = []
-        for top in self.categories:
-            if top.name:
-                out.append(top.name)
-            for child in top.children:
-                if child.name:
-                    out.append(f"{top.name}{SEPARATOR}{child.name}")
-        return out
+        return [path for path, _ in self._walk()]
 
     def top_levels(self) -> list[str]:
         return [c.name for c in self.categories if c.name]
@@ -261,25 +256,22 @@ class Taxonomy:
             return existing
 
         aliases = [a for a in (aliases or []) if str(a).strip()]
-        if SEPARATOR in raw:
-            parent_name, _, child_name = raw.partition(SEPARATOR)
-            parent_name = parent_name.strip()
-            child_name = child_name.strip()
-            parent = self._ensure_top(parent_name)
-            child = self._find_child(parent, child_name)
+        parts = [part.strip() for part in raw.split(SEPARATOR)]
+        if any(not part for part in parts):
+            raise ValueError("分类路径不能包含空层级")
+        node = self._ensure_top(parts[0])
+        names = [node.name]
+        for part in parts[1:]:
+            child = self._find_child(node, part)
             if child is None:
-                child = Category(name=child_name)
-                parent.children.append(child)
-            for a in aliases:
-                if a not in child.aliases:
-                    child.aliases.append(a)
-            canonical = f"{parent.name}{SEPARATOR}{child.name}"
-        else:
-            top = self._ensure_top(raw)
-            for a in aliases:
-                if a not in top.aliases:
-                    top.aliases.append(a)
-            canonical = top.name
+                child = Category(name=part)
+                node.children.append(child)
+            node = child
+            names.append(node.name)
+        for alias in aliases:
+            if alias not in node.aliases:
+                node.aliases.append(alias)
+        canonical = SEPARATOR.join(names)
 
         self._rebuild_index()
         return canonical
@@ -300,23 +292,12 @@ class Taxonomy:
         return None
 
     def _extend_aliases(self, canonical: str, aliases: list[str]):
-        if SEPARATOR in canonical:
-            parent_name, _, child_name = canonical.partition(SEPARATOR)
-            for top in self.categories:
-                if top.name == parent_name:
-                    child = self._find_child(top, child_name)
-                    if child:
-                        for a in aliases:
-                            if a and a not in child.aliases:
-                                child.aliases.append(a)
-                    break
-        else:
-            for top in self.categories:
-                if top.name == canonical:
-                    for a in aliases:
-                        if a and a not in top.aliases:
-                            top.aliases.append(a)
-                    break
+        for path, node in self._walk():
+            if path == canonical:
+                for alias in aliases:
+                    if alias and alias not in node.aliases:
+                        node.aliases.append(alias)
+                break
         self._rebuild_index()
 
     def register_pending(self, names: list[str]) -> list[str]:

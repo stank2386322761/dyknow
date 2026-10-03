@@ -6,7 +6,9 @@
 **AI 摘要由调用方的模型完成**，DyKnow 本身不调用任何外部 AI API。
 
 ```text
-抖音内容 → 抓取 → 下载视频 → 语音转录 → Markdown 笔记 → 模型阅读摘要 → 分类归档 → 索引
+默认更新：检查登录 → 同步新增收藏 → 只转录新增 → 每个视频一个 Markdown → 报告清单和路径。
+
+用户明确要求整理时，再由其他 AI 写摘要、分类并重建索引。
 ```
 
 ## 职责划分
@@ -17,6 +19,8 @@
 | **模型** | 阅读完整转录、生成一句话总结与要点、提取金句、判断分类建议 |
 
 程序不做理解，模型不做搬运和计数。
+
+更新收藏使用 `python -m dyknow sync --transcribe`，默认检查最近 200 条，只转录本次新增视频。调用方报告新增清单、转录成功/失败/跳过及 MD 路径，到此结束；不自动摘要、归档或索引。断点续跑用 `transcribe --ids <本次ID清单>`。抓取失败不等于没有新增。
 
 ## 快速开始
 
@@ -65,7 +69,7 @@ macOS/Linux:  .venv/bin/python        -m dyknow <command>
 | `sync [--count N] [--transcribe] [--full]` | 增量同步收藏（场景 B） |
 | `transcribe [--count N] [--retry-failed]` | 批量转录，支持断点续转 |
 | `browse -k "关键词" [--count N] [--transcribe]` | 关键词浏览（场景 C） |
-| `organize [--dry-run] [--migrate]` | 按分类安全移动笔记（场景 D） |
+| `organize [--dry-run] [--migrate] [--ids ...]` | 按分类安全移动笔记，可仅处理本次更新（场景 D） |
 | `index [--no-category-index]` | 全量重建知识库索引 |
 | `config [--set-output DIR]` | 查看 / 设置持久化配置（记住输出目录） |
 | `reset [--target ...] [--ids ...]` / `night` | 重置任务 / 夜间批量转录 |
@@ -248,3 +252,11 @@ python -m pytest tests/ -v
 ## 许可证
 
 MIT
+
+### 固定数据位置与登录复用
+
+Cookie、数据库、配置、缓存和日志位于 `DYKNOW_DATA_DIR`；未设置时自动使用 Git 主项目目录下的 `data/`，所有工作树共享登录信息；非 Git 项目使用代码目录的 `data/`。环境变量可显式覆盖。MD 输出目录通过 `config --set-output` 保存，配置文件也在该数据目录内。不要复制 Cookie 到多个工作树或提交到 Git。
+
+登录浏览器和收藏抓取浏览器是两个独立窗口，抓取窗口应复用 Cookie，无需再次扫码。`status` 只说明 Cookie 是否已保存，不证明服务端会接受它。接口无数据也可能是网络或抓取问题，不应直接认定必须重新登录。
+
+收藏更新在同一浏览器会话中完成必要的扫码与抓取。`login` 复用已保存 Cookie；明确需要重新扫码或切换账号时用 `login --force`。全量同步仅刷新数据库元数据，保留已有 MD 和处理状态；重转录只更新转写章节及相关状态，转写变化时保留摘要并标记 `needs_review`，空结果保留旧正文。

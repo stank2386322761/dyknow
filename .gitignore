@@ -40,3 +40,13 @@ Thumbs.db
 # ── 内部调试脚本 ──
 scripts/_*.py
 scripts/__pycache__/
+
+# 收藏交接清单（含用户内容）
+data/runs/
+data/update-*
+data/summaries-*
+data/themes-*
+data/收藏更新-*
+data/test-last.txt
+data/apply_summaries.py
+data/build_update_report.py

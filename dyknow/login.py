@@ -65,7 +65,42 @@ def save_cookies(cookies: list[dict]):
     logger.info(f"Cookie 已保存: {config.cookie_path}")
 
 
-async def login() -> list[dict] | None:
+async def login_in_context(context: BrowserContext, page: Page) -> list[dict] | None:
+    """在调用方的浏览器会话里扫码，成功后继续使用该会话。"""
+    cookies = await context.cookies()
+    if _is_logged_in(cookies):
+        save_cookies(cookies)
+        return cookies
+    await page.goto(DOUYIN_URL, wait_until="domcontentloaded", timeout=30000)
+    await asyncio.sleep(3)
+    if _is_logged_in(await context.cookies()):
+        cookies = await context.cookies()
+        save_cookies(cookies)
+        return cookies
+    # 页面已展示登录对话框时不再点击按钮。
+    dialogs = page.locator('[role="dialog"]')
+    visible_dialog = False
+    for index in range(await dialogs.count()):
+        if await dialogs.nth(index).is_visible():
+            visible_dialog = True
+            break
+    if not visible_dialog:
+        button = page.locator('//button[contains(text(),"登录")] | //span[contains(text(),"登录")]').first
+        if await button.is_visible() and not _is_logged_in(await context.cookies()):
+            await button.click()
+    print("📱 请扫码登录；成功后将继续抓取，无需再次扫码（最多等待 5 分钟）")
+    for _ in range(300):
+        cookies = await context.cookies()
+        if _is_logged_in(cookies):
+            save_cookies(cookies)
+            print("✅ 登录成功，已保存 Cookie")
+            return cookies
+        await asyncio.sleep(1)
+    print("登录超时")
+    return None
+
+
+async def login(force: bool = False) -> list[dict] | None:
     """
     打开浏览器，引导用户扫码登录抖音。
 
@@ -76,6 +111,10 @@ async def login() -> list[dict] | None:
     4. 检测登录态
     5. 保存并返回 Cookie
     """
+    saved = None if force else load_cookies()
+    if saved:
+        print("✅ 使用已保存 Cookie；重新扫码使用 login --force")
+        return saved
     config.ensure_dirs()
 
     print("\n" + "=" * 60)
@@ -110,55 +149,7 @@ async def login() -> list[dict] | None:
         page: Page = await context.new_page()
 
         try:
-            # 导航到抖音首页
-            print("🌐 正在打开抖音首页...")
-            await page.goto(DOUYIN_URL, wait_until="domcontentloaded", timeout=30000)
-
-            # 抖音首页默认会弹出二维码登录框，也可能需要点击"登录"按钮
-            # 先等页面稳定
-            await asyncio.sleep(3)
-
-            # 尝试点击登录按钮（如果有的话），触发二维码弹窗
-            try:
-                login_btn = await page.wait_for_selector(
-                    '//button[contains(text(),"登录")] | //span[contains(text(),"登录")]',
-                    timeout=5000
-                )
-                if login_btn:
-                    await login_btn.click()
-                    print("🖱️  已点击登录按钮")
-                    await asyncio.sleep(2)
-            except Exception:
-                pass  # 可能二维码已经弹出了
-
-            print()
-            print("📱 请在浏览器中扫码登录抖音...")
-            print("   （等待中，最多 5 分钟）")
-            print()
-
-            # 轮询检测登录态（每 1 秒检查一次，最多 300 秒）
-            max_wait = 300
-            for i in range(max_wait):
-                await asyncio.sleep(1)
-
-                # 获取当前所有 Cookie
-                cookies = await context.cookies()
-                if _is_logged_in(cookies):
-                    print("\n✅ 登录成功！")
-                    save_cookies(cookies)
-                    return cookies
-
-                # 每 10 秒输出一个点，让用户知道还在等
-                if (i + 1) % 10 == 0:
-                    dots = (i + 1) // 10
-                    print(f"   ⏳ 等待扫码中... {'.' * dots} ({i + 1}s)")
-
-            print("\n⚠️ 登录超时（5 分钟），请重试")
-            return None
-
-        except Exception as e:
-            print(f"\n❌ 登录过程出错: {e}")
-            raise
+            return await login_in_context(context, page)
 
         finally:
             await browser.close()

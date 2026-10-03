@@ -7,11 +7,13 @@ DyKnow 环境检测脚本
 
 import sys
 import subprocess
+import asyncio
 from pathlib import Path
 
 # 确保能导入 dyknow
 PROJECT_ROOT = Path(__file__).parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
+from dyknow.config import config
 
 PASS = "  [OK]"
 FAIL = "  [FAIL]"
@@ -28,6 +30,12 @@ def check(desc: str, ok: bool, fix_hint: str = "") -> bool:
         if fix_hint:
             print(f"       修复: {fix_hint}")
     return ok
+
+
+async def configured_chromium_path() -> Path:
+    from playwright.async_api import async_playwright
+    async with async_playwright() as p:
+        return Path(p.chromium.executable_path)
 
 
 def main():
@@ -55,6 +63,7 @@ def main():
         "playwright": "pip install playwright",
         "pywhispercpp": "pip install pywhispercpp",
         "av": "pip install av",
+        "yaml": "pip install pyyaml",
     }
     for pkg, fix in required.items():
         try:
@@ -77,6 +86,12 @@ def main():
         if not chromium_paths:
             chromium_paths = list(Path.home().glob("**/ms-playwright/chromium-*/chrome*"))
 
+    try:
+        configured_browser = asyncio.run(configured_chromium_path())
+        if configured_browser.is_file():
+            chromium_paths = [configured_browser]
+    except Exception:
+        pass
     if chromium_paths:
         all_ok &= check(f"Chromium 浏览器 ({chromium_paths[0]})", True)
     else:
@@ -112,10 +127,11 @@ def main():
             "安装 ffmpeg 并添加到 PATH: https://ffmpeg.org/download.html",
         )
     check("av 库 (备选)", has_av, "pip install av")
+    all_ok &= has_ffmpeg or has_av
 
     # ── 5. 转录模型 ──
     print("\n── 转录模型 ──")
-    models_dir = PROJECT_ROOT / "data" / "models"
+    models_dir = config.data_dir / "models"
     tiny_model = models_dir / "ggml-tiny.bin"
     small_model = models_dir / "ggml-small.bin"
 
@@ -126,7 +142,7 @@ def main():
         size_mb = tiny_model.stat().st_size / (1024 * 1024)
         all_ok &= check(f"ggml-tiny.bin ({size_mb:.0f} MB)", True)
     else:
-        all_ok &= check(
+        check(
             "ggml-tiny.bin",
             False,
             "下载: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.bin → 放入 data/models/",
@@ -142,9 +158,14 @@ def main():
             "下载: https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin → 放入 data/models/",
         )
 
+    active_model = Path(config.ggml_model_path)
+    has_active_model = active_model.is_file()
+    all_ok &= check(f"当前配置模型: {active_model}", has_active_model,
+                    "设置 DYKNOW_GGML_MODEL 为已有模型的绝对路径")
+
     # ── 6. 转录功能实测 ──
     print("\n── 转录功能实测 ──")
-    if has_tiny and (has_ffmpeg or has_av):
+    if has_active_model and (has_ffmpeg or has_av):
         try:
             from dyknow.transcriber import is_available, get_active_backend
             if is_available():
@@ -155,11 +176,11 @@ def main():
         except Exception as e:
             all_ok &= check("转录模块加载", False, str(e))
     else:
-        check("转录功能实测", False, "需模型文件和音频工具就绪后才能测试")
+        all_ok &= check("转录功能实测", False, "需模型文件和音频工具就绪后才能测试")
 
     # ── 7. 数据库 ──
     print("\n── 数据库 ──")
-    db_path = PROJECT_ROOT / "data" / "dyknow.db"
+    db_path = config.db_path
     if db_path.exists():
         size_mb = db_path.stat().st_size / (1024 * 1024)
         check(f"dyknow.db ({size_mb:.1f} MB)", True)
@@ -168,12 +189,12 @@ def main():
 
     # ── 8. 输出目录 ──
     print("\n── 输出目录 ──")
-    output_dir = PROJECT_ROOT / "抖音收藏"
+    output_dir = config.output_dir
     if output_dir.exists():
         md_count = len(list(output_dir.rglob("*.md")))
-        check(f"抖音收藏/ ({md_count} 条笔记)", True)
+        check(f"{output_dir} ({md_count} 个 Markdown 文件，含索引)", True)
     else:
-        check("抖音收藏/ (首次使用会自动创建)", True)
+        check(f"{output_dir} (首次使用会自动创建)", True)
 
     # ── 汇总 ──
     print()

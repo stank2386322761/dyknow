@@ -164,10 +164,15 @@ class SyncDB:
         """插入一条新的同步记录"""
         now = datetime.now().isoformat()
         self.conn.execute("""
-            INSERT OR REPLACE INTO sync_log
+            INSERT INTO sync_log
                 (aweme_id, title, author, favorite_folder, favorite_time,
                  cover_url, video_url, duration, status, note_path, updated_at)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(aweme_id) DO UPDATE SET
+                title=excluded.title, author=excluded.author,
+                favorite_folder=excluded.favorite_folder, favorite_time=excluded.favorite_time,
+                cover_url=excluded.cover_url, video_url=excluded.video_url,
+                duration=excluded.duration, updated_at=excluded.updated_at
         """, (
             str(aweme_id), title, author, favorite_folder, favorite_time,
             cover_url, video_url, duration, status, note_path, now

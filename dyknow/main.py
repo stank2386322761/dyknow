@@ -14,7 +14,7 @@ from .db import get_db
 
 def cmd_login(_args):
     from .login import login as do_login
-    cookies = asyncio.run(do_login())
+    cookies = asyncio.run(do_login(force=getattr(_args, "force", False)))
     return 0 if cookies else 1
 
 
@@ -24,7 +24,8 @@ def cmd_status(_args):
 
     print("\nDyKnow 状态")
     print("=" * 50)
-    print(f"登录: {'已登录' if load_cookies() else '未登录'}")
+    print(f"登录: {'已保存 Cookie（服务端有效性未验证）' if load_cookies() else '未登录'}")
+    print(f"登录文件: {config.cookie_path}")
     print(f"笔记目录: {config.output_dir}")
     print(f"           （来源：{config.output_dir_source()}）")
     print(f"数据库:   {config.db_path}")
@@ -34,12 +35,20 @@ def cmd_status(_args):
         print(f"  {status_name:<22} {cnt:>5}")
     print(f"  {'总计':<22} {db.total_count():>5}")
 
-    breakdown = db.get_processing_breakdown()
-    if breakdown:
+    # AI 编辑的是 Markdown；数据库字段可能尚未回填，以实际笔记为准。
+    if config.output_dir.is_dir():
+        from .indexer import IndexBuilder
+        builder = IndexBuilder(config.output_dir)
+        builder.scan()
+        stats = builder.stats()
         print()
-        print("AI 知识处理状态:")
-        for name in ("pending", "done", "needs_review"):
-            print(f"  {name:<22} {breakdown.get(name, 0):>5}")
+        print("AI 知识处理状态（实际笔记扫描）:")
+        for name, key in (("pending", "pending"), ("done", "processed"),
+                          ("needs_review", "needs_review")):
+            print(f"  {name:<22} {stats[key]:>5}")
+        print(f"  {'笔记总计':<22} {stats['total']:>5}")
+        if stats["total"] != db.total_count():
+            print("  提示: 笔记数量与数据库记录数不同，流水线统计与笔记统计分别展示。")
     db.close()
     return 0
 
@@ -61,6 +70,7 @@ def cmd_transcribe(args):
     _apply_output(args)
     return Syncer()._phase2_transcribe(
         count=args.count,
+        source_ids=set(_parse_ids_arg(args.ids)) if getattr(args, "ids", "") else None,
         include_failed=args.retry_failed,
         max_attempts=args.max_attempts,
     )
@@ -294,7 +304,13 @@ def cmd_organize(args):
         print(f"知识库目录不存在: {root}")
         return 1
 
-    org = Organizer(root, dry_run=args.dry_run, migrate=args.migrate)
+    raw_ids = getattr(args, "ids", "")
+    source_ids = set(_parse_ids_arg(raw_ids)) if raw_ids else None
+    if raw_ids and not source_ids:
+        print("未提供有效 ID，未执行归档")
+        return 1
+    org = Organizer(root, dry_run=args.dry_run, migrate=args.migrate,
+                    source_ids=source_ids)
     plans, _ = org.plan()
     result = org.apply(plans)
 
@@ -357,12 +373,12 @@ def cmd_taxonomy(args):
         print("  （暂无分类）")
         return 0
 
-    for top in tax.categories:
-        alias = f"  别名: {', '.join(top.aliases)}" if top.aliases else ""
-        print(f"  📂 {top.name}{alias}")
-        for child in top.children:
-            calias = f"  别名: {', '.join(child.aliases)}" if child.aliases else ""
-            print(f"     └ {child.name}{calias}")
+    def show(categories, depth=0):
+        for category in categories:
+            alias = f"  别名: {', '.join(category.aliases)}" if category.aliases else ""
+            print(f"  {'   ' * depth}{'📂' if not depth else '└'} {category.name}{alias}")
+            show(category.children, depth + 1)
+    show(tax.categories)
     return 0
 
 
@@ -396,7 +412,8 @@ def main():
     )
 
     sub = parser.add_subparsers(dest="command")
-    sub.add_parser("login", help="扫码登录")
+    lp = sub.add_parser("login", help="复用登录信息或扫码登录")
+    lp.add_argument("--force", action="store_true", help="强制扫码，重新登录或切换账号")
     sub.add_parser("status", help="查看状态")
 
     sp = sub.add_parser("sync", help="批量同步收藏")
@@ -424,6 +441,7 @@ def main():
         "--max-attempts", type=int, default=3,
         help="单条任务最大尝试次数，超过则跳过（默认 3）",
     )
+    tp.add_argument("--ids", default="", help="只转录指定视频 ID（逗号分隔或 ID 文件）")
     tp.add_argument("--output", default=None, help="笔记输出目录（本次运行覆盖配置）")
 
     # reset 子命令
@@ -482,6 +500,7 @@ def main():
     op = sub.add_parser("organize", help="按分类安全移动笔记")
     op.add_argument("--output", default=None, help="知识库根目录")
     op.add_argument("--dry-run", action="store_true", help="只显示计划，不修改文件")
+    op.add_argument("--ids", default="", help="仅归档这些视频 ID（逗号分隔或每行一个 ID 的文件）")
     op.add_argument(
         "--migrate", action="store_true",
         help="同时迁移旧「未分类/」目录中的笔记（默认不迁移）",

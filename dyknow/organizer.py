@@ -93,10 +93,12 @@ class OrganizeResult:
 class Organizer:
     """按分类安全移动笔记"""
 
-    def __init__(self, root: Path, dry_run: bool = False, migrate: bool = False):
+    def __init__(self, root: Path, dry_run: bool = False, migrate: bool = False,
+                 source_ids: set[str] | None = None):
         self.root = Path(root)
         self.dry_run = dry_run
         self.migrate = migrate
+        self.source_ids = source_ids
         self.builder = IndexBuilder(self.root)
         self.taxonomy: Taxonomy = self.builder.taxonomy
         # plan() 中判定为达到阈值的新分类：原始值 → 规范路径
@@ -109,6 +111,8 @@ class Organizer:
     def plan(self) -> tuple[list[MovePlan], list[str]]:
         """生成归档计划（dry_run 时不会写入任何文件）"""
         notes = self.builder.scan()
+        if self.source_ids is not None:
+            notes = [n for n in notes if n.source_id in self.source_ids]
 
         promoted = self._promote_categories(notes)
         self.promoted = promoted

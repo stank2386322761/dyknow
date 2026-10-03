@@ -43,26 +43,26 @@ Windows 虚拟环境：`.venv/Scripts/python.exe -m dyknow <command>`；macOS/Li
 
 ## 场景 B：同步收藏
 
-触发语：「同步我的收藏」「备份抖音内容」「把收藏都存下来」。
+触发语：「更新抖音收藏」「同步我的收藏」「备份抖音内容」。
 
-```text
-1. [CLI]  python -m dyknow status          → 检查登录态与既有条目数
-2. [CLI]  python -m dyknow login           → 未登录则扫码（浏览器只用于扫码）
-3. [CLI]  python -m dyknow sync            → 增量同步元数据索引（快，秒级）
-4. [AI]   向用户报告工作量：
-          「共发现 N 条，其中 M 条需要下载和转录。转录属耗时步骤，
-            将逐条处理，状态会保留，失败后可从中断处继续。」
-          不要给出精确完成时间——除非程序确实读到了视频总时长。
-5. [CLI]  python -m dyknow transcribe      → 批量下载 + 转录（支持断点续转）
-          可选：--count N 限制本次条数；--retry-failed 纳入失败重试
-6. [AI]   逐条读取已转录的笔记，写 AI 摘要、章节要点、金句，
-          更新 processing_status / summarized_from_hash / category
-7. [CLI]  python -m dyknow organize
-8. [CLI]  python -m dyknow index
-```
+默认流程：检查登录 → 同步并记录新增 → 只转录新增 → 更新各自 MD → 报告结果与位置 → 交给其他 AI 整理。
 
-**幂等**：同一 `source_id` 已有成功转录，且转录内容未变时，不要重复转录。
-`transcript_hash == summarized_from_hash` 且 `processing_status: done` 时，不要重复摘要。
+1. `python -m dyknow status` 查看 Cookie 文件、数据库及输出目录。已保存 Cookie 不代表服务端登录仍然有效。
+2. 直接同步：程序无 Cookie 时在抓取浏览器内扫码；有 Cookie 时先尝试同步，不主动重复扫码。抓取失败不等于登录失效，不应无限循环登录。
+3. `python -m dyknow sync --transcribe` 默认检查最近 200 条收藏，按视频 ID 去重，只转录本次新增条目，不补处理历史队列。
+4. 每个视频保留一个 MD，转录写入「📝 完整转写」，不生成摘要、不归档、不重建知识库索引。
+5. 中断后仅续跑本次 ID：`python -m dyknow transcribe --ids <逗号分隔ID或ID文件>`；失败重试加 `--retry-failed`。
+
+### 同步结果与用户总结（必做）
+
+同步前记录已有 ID，结束后按 ID 对比本次变化，并核对这些条目的数据库状态及实际 MD 文件。
+
+- 列出新增视频标题、作者及 MD 路径；数量多时保存完整 Markdown 清单并链接。
+- 报告检查范围、新增、转录成功、失败、跳过及剩余待处理数量。
+- 明确文件位置，交给其他 AI 继续整理；不要求阅读全部转录并总结内容。
+- 没有新增时说明「本次检查范围内没有新收藏」，不自动转录旧任务。
+- 抓取失败、只有元数据、转录失败分别报告，不声称更新完成。
+- 仅在用户明确要求整理时执行场景 D。
 
 ### 批处理「处理收藏 / 整理知识库」（场景 D）
 

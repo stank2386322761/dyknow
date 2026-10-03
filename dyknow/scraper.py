@@ -11,7 +11,7 @@ from dataclasses import dataclass, field
 
 from playwright.async_api import async_playwright
 
-from .login import load_cookies
+from .login import load_cookies, login_in_context, save_cookies
 
 logger = logging.getLogger("dyknow.scraper")
 
@@ -74,8 +74,6 @@ async def fetch(count: int = 200) -> list[FavoriteItem]:
     """抓取收藏列表"""
 
     cookies = load_cookies()
-    if not cookies:
-        raise RuntimeError("未登录，请先运行 dyknow login")
 
     print(f"\n正在抓取收藏列表（目标 {count} 条）...")
 
@@ -98,7 +96,8 @@ async def fetch(count: int = 200) -> list[FavoriteItem]:
                 "Chrome/120.0.0.0 Safari/537.36"
             ),
         )
-        await context.add_cookies(cookies)
+        if cookies:
+            await context.add_cookies(cookies)
         page = await context.new_page()
 
         # ── API 拦截 ──
@@ -130,8 +129,17 @@ async def fetch(count: int = 200) -> list[FavoriteItem]:
 
         # ── 导航到收藏页 ──
         try:
+            if not cookies:
+                if not await login_in_context(context, page):
+                    raise RuntimeError("登录未完成，未抓取收藏")
             print("   加载收藏页面...")
             await page.goto(FAVORITE_PAGE, wait_until="domcontentloaded", timeout=30000)
+            # 明确跳转到登录页才重新登录；空数据不等同于登录失效。
+            if "login" in page.url.lower():
+                await context.clear_cookies()
+                if not await login_in_context(context, page):
+                    raise RuntimeError("重新登录未完成")
+                await page.goto(FAVORITE_PAGE, wait_until="domcontentloaded", timeout=30000)
             # 页面加载完成后立即最小化窗口
             cdp = await browser.new_browser_cdp_session()
             try:
@@ -196,6 +204,10 @@ async def fetch(count: int = 200) -> list[FavoriteItem]:
                     no_change = 0
 
             await asyncio.sleep(2)
+            refreshed = await context.cookies()
+            from .login import _is_logged_in
+            if _is_logged_in(refreshed):
+                save_cookies(refreshed)
 
         finally:
             await browser.close()

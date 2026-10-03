@@ -72,15 +72,6 @@ class Syncer:
             if only_transcribe:
                 return self._phase2_transcribe(count=count)
 
-            cookies = load_cookies()
-            if not cookies:
-                print("需要登录...")
-                from .login import login as do_login
-                cookies = asyncio.run(do_login())
-                if not cookies:
-                    print("登录失败")
-                    return 1
-
             items = asyncio.run(scrape_fetch(count=count))
             if not items:
                 print("未获取到任何收藏")
@@ -97,6 +88,12 @@ class Syncer:
 
             print(f"\n阶段1：生成 {len(items)} 条笔记...")
             added = self._index_items(items)
+            run_dir = config.data_dir / "runs" / datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            run_dir.mkdir(parents=True, exist_ok=True)
+            ids_path = run_dir / "new.ids"
+            ids_path.write_text("\n".join(item.aweme_id for item in items) + "\n", encoding="utf-8")
+            print(f"本次新增 ID 清单: {ids_path}")
+            self._write_update_report(items, run_dir)
 
             total = self.db.total_count()
             print(f"\n阶段1完成: 新增 {added} 条，累计 {total} 条")
@@ -106,12 +103,34 @@ class Syncer:
                 print("\n提示: dyknow transcribe 可转录语音（支持断点续转）")
                 return 0
 
-            return self._phase2_transcribe()
+            result = self._phase2_transcribe(source_ids={item.aweme_id for item in items})
+            self._write_update_report(items, run_dir)
+            return result
 
         except Exception as e:
             logger.error(f"同步失败: {e}")
             traceback.print_exc()
             return 1
+
+    def _write_update_report(self, items, run_dir):
+        """用本次 ID 的实际状态生成交接清单，不读取或总结视频内容。"""
+        lines = ["# 本次收藏更新", "", f"新增候选：{len(items)} 条", ""]
+        counts = {"transcribed": 0, "failed": 0, "pending": 0}
+        for item in items:
+            row = self.db.conn.execute(
+                "SELECT status, note_path FROM sync_log WHERE aweme_id = ?",
+                (item.aweme_id,),
+            ).fetchone()
+            status, path = (row[0], row[1]) if row else ("未写入", "")
+            key = status if status in ("transcribed", "failed") else "pending"
+            counts[key] += 1
+            title = item.title.replace("\n", " ").replace("[", "（").replace("]", "）")
+            link = f"[{title}](<{Path(path).as_posix()}>)" if path else title
+            lines.append(f"- {link} — {item.author} — {status} — `{item.aweme_id}`")
+        lines[3:3] = [f"转录成功：{counts['transcribed']}；失败：{counts['failed']}；待处理：{counts['pending']}", ""]
+        report = run_dir / "更新清单.md"
+        report.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        print(f"更新清单: {report}")
 
     # ── 阶段1 辅助：落盘 + 入库 ─────────────────────
 
@@ -127,6 +146,15 @@ class Syncer:
         added = 0
         for i, item in enumerate(items, 1):
             try:
+                existing = self.db.conn.execute(
+                    "SELECT note_path FROM sync_log WHERE aweme_id = ?", (item.aweme_id,)
+                ).fetchone()
+                if existing:
+                    # 全量刷新只更新元数据，保留原 MD、路径及处理状态。
+                    self.db.insert(item.aweme_id, title=item.title, author=item.author,
+                                   cover_url=item.cover_url, video_url=item.video_url,
+                                   duration=item.duration)
+                    continue
                 note_path = generate_note(
                     title=item.title,
                     aweme_id=item.aweme_id,
@@ -226,6 +254,7 @@ class Syncer:
         count: int = 0,
         include_failed: bool = False,
         max_attempts: int = 3,
+        source_ids: set[str] | None = None,
     ) -> int:
         """转录主流程，支持断点续转、Ctrl+C 安全退出、失败重试。"""
         if not transcribe_available():
@@ -237,6 +266,8 @@ class Syncer:
             return 1
 
         pending = self.db.get_pending_for_transcribe(include_failed=include_failed)
+        if source_ids is not None:
+            pending = [row for row in pending if row["aweme_id"] in source_ids]
         if count and count > 0:
             pending = pending[:count]
         if not pending:
@@ -456,6 +487,12 @@ class Syncer:
         video_path: Optional[Path] = None
         audio_path: Optional[Path] = None
 
+        # 成功必须意味着转录已落到笔记，不能只更新数据库后丢弃正文。
+        if not note_path or not note_path.is_file():
+            error = "笔记文件缺失，需恢复笔记路径后重试"
+            self._mark_failed(aweme_id, None, error)
+            return False, {"error": error}
+
         # ── 决定从哪一步开始 ──
         need_download = current_status in (STATUS_PENDING_INDEX, STATUS_PENDING_DOWNLOAD, STATUS_FAILED)
         need_audio = need_download or current_status == STATUS_PENDING_AUDIO
@@ -513,8 +550,9 @@ class Syncer:
                     return False, {"error": "转录结果为空"}
 
                 # 写入笔记（原子写）
-                if note_path and note_path.exists():
-                    update_transcript(note_path, text)
+                if not update_transcript(note_path, text):
+                    self._mark_failed(aweme_id, note_path, "转录写入笔记失败")
+                    return False, {"error": "转录写入笔记失败"}
 
                 # 清理音频缓存（DYKNOW_KEEP_MEDIA_CACHE=1 时保留）
                 if not self._keep_cache:

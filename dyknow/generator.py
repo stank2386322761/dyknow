@@ -164,6 +164,17 @@ def generate_note(
 ) -> Path:
     """生成一条完整的 Obsidian 笔记，返回文件路径"""
 
+    # 标题变化或已归档时也复用同一视频的已有文件。
+    sid = source_id or aweme_id
+    search_root = Path(output_dir) if output_dir is not None else config.output_dir
+    if sid and search_root.is_dir():
+        for existing in search_root.rglob(f"*_{sid}.md"):
+            meta, _ = fm_io.parse_frontmatter(fm_io.read_text(existing))
+            if str(meta.get("source_id") or meta.get("video_id") or "") == sid:
+                if transcript and transcript.strip():
+                    update_transcript(existing, transcript)
+                return existing
+
     today = datetime.now().strftime("%Y-%m-%d")
     safe_title = safe_filename(title)
     duration_str = _format_duration(duration)
@@ -281,6 +292,9 @@ def generate_note(
 
     filename = f"{safe_title}_{sid}.md" if sid else f"{safe_title}.md"
     output_path = output_dir / filename
+    if output_path.exists():
+        logger.info("保留已有笔记: %s", output_path)
+        return output_path
     atomic_write_text(output_path, fm_io.dump_frontmatter(meta, body))
 
     logger.info("笔记已生成: %s", output_path.name)
@@ -311,6 +325,9 @@ def update_transcript(note_path: Path, transcript: str) -> bool:
         return False
 
     meta, _body = fm_io.parse_frontmatter(text)
+
+    if not transcript or not transcript.strip():
+        return mark_transcript_failed(note_path)
 
     new_hash = transcript_hash(transcript)
     prev_summarized = str(meta.get("summarized_from_hash") or "").strip()
