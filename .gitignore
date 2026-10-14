@@ -35,3 +35,15 @@ Thumbs.db
 # ── 内部调试脚本 ──
 scripts/_*.py
 scripts/__pycache__/
+# DyKnow 3 runtime and local verification artifacts
+*.part
+*.tmp
+.env
+.env.*
+/data/
+/runtime/
+/browser-profile/
+/cache/
+/models/
+/logs/
+/抖音知识库/
