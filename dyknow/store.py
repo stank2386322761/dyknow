@@ -9,13 +9,16 @@ from pathlib import Path
 from . import note
 from .douyin import Comment, Video
 
-_ID_IN_NAME = re.compile(r"_(\d{6,25})\.md$")
+# 抖音是纯数字 ID；其他平台带前缀：xhs-…、zh-a…、bili-BV…
+_ID_IN_NAME = re.compile(r"_([a-z]{2,6}-[0-9A-Za-z]{3,40}|\d{6,25})\.md$")
 INDEX_NAME = "索引.md"
 
 FOLDER_FAVORITES = "收藏"
 FOLDER_LINKS = "链接"
 FOLDER_SEARCH = "搜索"
 FOLDER_CREATOR = "博主"
+FOLDER_RESEARCH = "对标"
+FOLDER_HOT = "热榜"
 
 
 class Store:
@@ -62,6 +65,18 @@ class Store:
         path = folder / note.file_name(video, day or date.today().isoformat())
         note.write_atomic(path, note.render(video, template, status, comments))
         self.ids[video.id] = path
+        return path, True
+
+    def create_item(self, item, folder: Path, template: str, day: str | None = None) -> tuple[Path, bool]:
+        """其他平台的内容（小红书 / 知乎 / B站）建笔记"""
+        existing = self.find(item.id)
+        if existing:
+            return existing, False
+        status = note.PENDING if item.media_urls else note.READY
+        name = f"{day or date.today().isoformat()}_{note.safe_name(item.title)}_{item.id}.md"
+        path = folder / name
+        note.write_atomic(path, note.render_item(item, template, status))
+        self.ids[item.id] = path
         return path, True
 
     def notes(self) -> list[note.NoteInfo]:

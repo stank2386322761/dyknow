@@ -82,10 +82,14 @@ def probe(path: Path) -> Probe | None:
 # ── 下载 ──────────────────────────────────────
 
 
-def _fetch(url: str, dest: Path, timeout: int) -> None:
+def _headers(referer: str = "") -> dict:
+    return {**HEADERS, "Referer": referer} if referer else HEADERS
+
+
+def _fetch(url: str, dest: Path, timeout: int, referer: str = "") -> None:
     part = dest.with_name(dest.name + ".part")
     try:
-        with requests.get(url, headers=HEADERS, stream=True, timeout=timeout) as r:
+        with requests.get(url, headers=_headers(referer), stream=True, timeout=timeout) as r:
             r.raise_for_status()
             ctype = r.headers.get("content-type", "")
             if "text/html" in ctype or "json" in ctype:
@@ -109,7 +113,7 @@ def _fetch(url: str, dest: Path, timeout: int) -> None:
 
 
 def download(urls: list[str], dest_dir: Path, name: str, timeout: int = 60,
-             require_audio: bool = True) -> Path:
+             require_audio: bool = True, referer: str = "") -> Path:
     """依次尝试候选地址，返回第一个可用的文件（require_audio 时必须带声音）"""
     if not urls:
         raise DownloadError("没有可下载的地址")
@@ -118,7 +122,7 @@ def download(urls: list[str], dest_dir: Path, name: str, timeout: int = 60,
     errors: list[str] = []
     for url in urls[:8]:
         try:
-            _fetch(url, final, timeout)
+            _fetch(url, final, timeout, referer)
             if require_audio:
                 pr = probe(final)
                 if pr is not None and not pr.has_audio:
@@ -132,7 +136,8 @@ def download(urls: list[str], dest_dir: Path, name: str, timeout: int = 60,
     raise DownloadError("；".join(dict.fromkeys(errors[-3:])) or "下载失败")
 
 
-def download_images(urls: list[str], dest_dir: Path, limit: int, timeout: int = 30) -> list[Path]:
+def download_images(urls: list[str], dest_dir: Path, limit: int, timeout: int = 30,
+                    referer: str = "") -> list[Path]:
     """下载图文作品的图片"""
     out: list[Path] = []
     if not urls or limit <= 0:
@@ -140,7 +145,7 @@ def download_images(urls: list[str], dest_dir: Path, limit: int, timeout: int = 
     _clear(dest_dir)
     for i, url in enumerate(urls[:limit], 1):
         try:
-            with requests.get(url, headers=HEADERS, timeout=timeout) as r:
+            with requests.get(url, headers=_headers(referer), timeout=timeout) as r:
                 r.raise_for_status()
                 ctype = r.headers.get("content-type", "")
                 ext = ".webp" if "webp" in ctype or ".webp" in url else ".png" if "png" in ctype else ".jpg"

@@ -157,7 +157,104 @@ def _code_for(stats: Stats) -> int:
 # ── 命令 ──────────────────────────────────────
 
 
+def cmd_login_site(ctx: Ctx, site: str) -> int:
+    """小红书 / 知乎 / B站 等平台登录：打开登录页，等用户扫码"""
+    from . import sites
+    import time as _t
+    mod = sites.module(site)
+    name = sites.PLATFORM_NAMES[site]
+    try:
+        with browser.Browser(ctx.cfg, headless=False, log=ctx.log, start_url=mod.LOGIN_URL) as b:
+            first = b.cookie_names(mod.LOGIN_URL)
+            ctx.log(f"📱 浏览器已打开{name}：请在页面上扫码或登录（最多等 5 分钟）…")
+            deadline = _t.time() + 300
+            while _t.time() < deadline:
+                b.page.wait_for_timeout(3000)
+                now = b.cookie_names(mod.LOGIN_URL)
+                if site == "xhs":  # 小红书游客也有 web_session，登录后会换成新的
+                    ok = bool(now.get("web_session")) and now.get("web_session") != first.get("web_session")
+                else:
+                    ok = bool(mod.logged_in(b, ctx.cfg))
+                if ok:
+                    b.page.wait_for_timeout(3000)
+                    ctx.log(f"✅ {name}登录成功，以后不用再扫码。")
+                    return ctx.finish("login", OK, "运行 dyknow find <关键词> 找对标内容", site=site)
+            return ctx.finish("login", NEED_LOGIN, f"重新运行 dyknow login --site {site}，并在 5 分钟内完成登录",
+                              site=site, reason="timeout")
+    except browser.BrowserError as e:
+        return _platform_fail(ctx, "login", e.reason, e.detail)
+    except Exception:  # noqa: BLE001  用户关掉了窗口
+        return ctx.finish("login", NEED_LOGIN, f"重新运行 dyknow login --site {site}", site=site, reason="closed")
+
+
+def cmd_hot(ctx: Ctx, args) -> int:
+    from . import research, sites
+    plats = sites.platforms(args.platforms, research.HOT_DEFAULT)
+    try:
+        out = research.hot(ctx.cfg, plats, args.limit, ctx.log)
+    except browser.BrowserError as e:
+        return _platform_fail(ctx, "hot", e.reason, e.detail)
+    return _research_finish(ctx, "hot", out, "把热榜文件交给 AI，让它按文件开头的说明挑出和你有关的热点")
+
+
+def cmd_find(ctx: Ctx, args) -> int:
+    from . import research, sites
+    kw = " ".join(args.keyword).strip()
+    plats = sites.platforms(args.platforms, research.FIND_DEFAULT)
+    ctx.log(f"找对标：「{kw}」，平台：{'、'.join(sites.PLATFORM_NAMES[p] for p in plats)}，"
+            f"{'最近 %d 天' % args.days if args.days > 0 else '不限时间'}，每个平台取点赞最高的 {args.limit} 条"
+            + (f"，前 {args.save} 条存成笔记" if args.save else ""))
+    try:
+        out = research.find(ctx.cfg, kw, plats, args.days, args.limit, args.save, ctx.log,
+                            transcribe=not args.no_transcribe)
+    except browser.BrowserError as e:
+        return _platform_fail(ctx, "find", e.reason, e.detail)
+    if out.stats.new or out.stats.existing:
+        index.rebuild(Store(ctx.cfg.output_dir))
+    return _research_finish(ctx, "find", out, "把对标报告交给 AI，让它按文件开头的说明写选题建议")
+
+
+def _research_finish(ctx: Ctx, command: str, out, ok_next: str) -> int:
+    from . import sites
+    ctx.log("")
+    for p, rows in out.results.items():
+        ctx.log(f"✅ {sites.PLATFORM_NAMES[p]}：{len(rows)} 条")
+    for p, e in out.errors.items():
+        ctx.log(f"❌ {sites.PLATFORM_NAMES[p]}：{e}")
+    if out.stats.new or out.stats.transcribed or out.stats.failed:
+        ctx.log(f"存成笔记 {out.stats.new} 条，转录成功 {out.stats.transcribed}，失败 {out.stats.failed}")
+    if out.report:
+        ctx.log(f"报告：{out.report}")
+    need_login = [p for p, r in out.reasons.items() if r == "login"]
+    parse_bad = [p for p, r in out.reasons.items() if r == "parse"]
+    steps = []
+    if need_login:
+        steps.append("请用户运行 " + "、".join(f"dyknow login --site {p}" for p in need_login) + " 登录后重试")
+    if parse_bad:
+        steps.append(f"把原始数据文件夹 {out.raw_dir} 发给开发者修解析")
+    if not out.results:
+        code = NEED_LOGIN if need_login and len(need_login) == len(out.errors) else PLATFORM
+    elif out.errors or out.stats.failed or out.stats.pending:
+        code = PARTIAL
+    else:
+        code = OK
+    nxt = "；".join(steps + ([ok_next] if out.results else []))
+    return ctx.finish(command, code, nxt, report=str(out.report or ""),
+                      platforms={sites.PLATFORM_NAMES[p]: len(v) for p, v in out.results.items()},
+                      errors={sites.PLATFORM_NAMES[p]: e for p, e in out.errors.items()},
+                      saved=out.stats.new, transcribed=out.stats.transcribed, raw_dir=str(out.raw_dir or ""))
+
+
 def cmd_login(ctx: Ctx, args) -> int:
+    site = getattr(args, "site", "") or ""
+    if site:
+        from . import sites
+        key = sites.platforms(site, [])
+        if not key:
+            ctx.log(f"不认识的平台：{site}。可用：xhs（小红书）、zhihu（知乎）、bili（B站）、douyin（抖音）")
+            return ctx.finish("login", ERROR, reason="unknown_site")
+        if key[0] != "douyin":
+            return cmd_login_site(ctx, key[0])
     try:
         with browser.Douyin(ctx.cfg, headless=False, log=ctx.log) as dy:
             force = args.force
@@ -534,6 +631,9 @@ def build_parser() -> argparse.ArgumentParser:
   dyknow creator 博主主页链接        抓博主作品
   dyknow todo                      列出等 AI 整理的笔记
   dyknow frames                    给笔记补画面截图（给能看图的 AI 用）
+  dyknow hot                       今日热榜（抖音 / 知乎 / 微博 / B站 / 小红书）
+  dyknow find AI编程 --days 30      跨平台找对标，按点赞排序
+  dyknow login --site xhs          登录小红书（zhihu 知乎 / bili B站）
   dyknow doctor                    检查显卡、登录、目录是否正常
 """)
     p.add_argument("--version", action="version", version=f"dyknow {__version__}")
@@ -541,6 +641,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     s = sub.add_parser("login", help="扫码登录（只需一次）")
     s.add_argument("--force", action="store_true", help="清除登录状态重新扫码（换账号用）")
+    s.add_argument("--site", default="", help="登录其他平台：xhs（小红书）/ zhihu（知乎）/ bili（B站），不填 = 抖音")
 
     s = sub.add_parser("update", help="同步新收藏并转录")
     s.add_argument("--limit", type=int, default=0, help="最多检查最新多少条收藏")
@@ -567,6 +668,18 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("todo", help="列出等 AI 整理的笔记")
     s.add_argument("--limit", type=int, default=20)
 
+    s = sub.add_parser("hot", help="今日热榜（抖音 / 知乎 / 微博 / B站 / 小红书热搜）")
+    s.add_argument("--platforms", default="", help="只看这些平台，逗号分隔，如 douyin,zhihu")
+    s.add_argument("--limit", type=int, default=30, help="每个平台取前多少条（默认 30）")
+
+    s = sub.add_parser("find", help="跨平台找对标：按关键词搜索，按点赞排序，生成对标报告")
+    s.add_argument("keyword", nargs="+")
+    s.add_argument("--platforms", default="", help="默认 xhs,zhihu,bili,douyin（小红书、知乎、B站、抖音）")
+    s.add_argument("--days", type=int, default=30, help="只要最近多少天的（默认 30，0 = 不限）")
+    s.add_argument("--limit", type=int, default=20, help="每个平台保留点赞最高的多少条（默认 20）")
+    s.add_argument("--save", type=int, default=0, help="每个平台前几条存成完整笔记（正文、图片、转录），默认 0")
+    s.add_argument("--no-transcribe", action="store_true", help="存笔记时不转录视频")
+
     s = sub.add_parser("frames", help="给已有笔记补上画面截图（给能看图的 AI 用）")
     s.add_argument("ids", nargs="*", help="只处理这些视频（ID 或链接）；不填 = 所有还没有截图的笔记")
     s.add_argument("--limit", type=int, default=20, help="最多处理多少条（默认 20）")
@@ -590,7 +703,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 HANDLERS = {
     "login": cmd_login, "update": cmd_update, "link": cmd_link, "search": cmd_search,
-    "creator": cmd_creator, "transcribe": cmd_transcribe, "frames": cmd_frames, "todo": cmd_todo, "index": cmd_index,
+    "creator": cmd_creator, "transcribe": cmd_transcribe, "frames": cmd_frames, "hot": cmd_hot, "find": cmd_find, "todo": cmd_todo, "index": cmd_index,
     "config": cmd_config, "migrate": cmd_migrate, "doctor": cmd_doctor,
 }
 

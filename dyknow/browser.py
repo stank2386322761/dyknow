@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -178,15 +179,21 @@ class ProfileLock:
 
 
 class Douyin:
-    def __init__(self, cfg: Config, headless: bool | None = None, log: Callable[[str], None] = print):
+    def __init__(self, cfg: Config, headless: bool | None = None, log: Callable[[str], None] = print,
+                 start_url: str | None = None):
         self.cfg = cfg
         self.base = cfg.base_url.rstrip("/")
+        # 打开浏览器后先去的页面；其他平台传 ""（不预先打开抖音）
+        self.start_url = self.base + "/" if start_url is None else start_url
+        self.raw_dir = None  # 设置后，页面方式抓到的原始数据会存一份（排查解析问题用）
+        self._raw_n = 0
+        self.captured = 0    # 页面方式最近一次收到了多少个接口返回（有返回但解析不出 = 网站结构变了）
         self.headless = cfg.get("headless") if headless is None else headless
         self.log = log
         self._pw = None
         self.ctx = None
         self.page = None
-        self._watch: str = ""
+        self._watch: str | tuple = ""
         self._responses: list = []
         self.channel_used = ""
         self._lock: ProfileLock | None = None
@@ -239,7 +246,8 @@ class Douyin:
             self.page.set_default_timeout(30_000)
             # 只收"已经下载完"的请求：直接读 response 会卡在一直不结束的流式接口上
             self.page.on("requestfinished", self._on_request_finished)
-            self._goto(self.base + "/")
+            if self.start_url:
+                self._goto(self.start_url)
         except BaseException:
             self.close()
             raise
@@ -268,8 +276,11 @@ class Douyin:
         self.page.wait_for_timeout(2500)
 
     def _on_request_finished(self, request) -> None:
+        if not self._watch:
+            return
         url = request.url
-        if self._watch and self._watch in url and "stream" not in url:
+        watches = (self._watch,) if isinstance(self._watch, str) else self._watch
+        if "stream" not in url and any(w in url for w in watches):
             self._responses.append(request)
 
     def _pause(self) -> None:
@@ -309,6 +320,8 @@ class Douyin:
     # ── 两种取数方式 ──────────────────────────
 
     def api(self, path: str, params: dict | None = None, method: str = "GET", body: dict | None = None) -> dict:
+        if urlparse(self.page.url).netloc != urlparse(self.base).netloc:
+            self._goto(self.base + "/")  # 页面内请求必须在抖音主站页面上发
         try:
             resp = self.page.evaluate(_XHR_JS, {"path": path, "params": {k: str(v) for k, v in (params or {}).items()},
                                                 "method": method, "body": body})
@@ -316,19 +329,29 @@ class Douyin:
             raise ApiFail(BLOCKED, f"页面请求出错：{str(e).splitlines()[0][:80]}")
         return classify(resp if isinstance(resp, dict) else {})
 
-    def page_collect(self, url: str, watch: str, extract: Callable[[dict], list[dict]],
-                     limit: int, rounds: int = 40, idle_rounds: int = 6, max_seconds: int = 120) -> list[dict]:
-        """打开页面、滚动，收集页面自己加载的接口数据（最多 max_seconds 秒，不会无限等）"""
+    def page_collect(self, url: str, watch, extract: Callable[[dict], list[dict]],
+                     limit: int, rounds: int = 40, idle_rounds: int = 6, max_seconds: int = 120,
+                     key: Callable[[dict], str] | None = None,
+                     after_open: Callable[[], None] | None = None) -> list[dict]:
+        """打开页面、滚动，收集页面自己加载的接口数据（最多 max_seconds 秒，不会无限等）。
+        watch：接口地址里包含的片段（可以是多个）；key：去重用的 ID；after_open：打开页面后先做的操作（如点筛选）"""
+        key = key or (lambda a: str(a.get("aweme_id") or a.get("cid") or ""))
         self._show_window()
         self._responses = []
         self._watch = watch
         seen: set[str] = set()
         items: list[dict] = []
         idle = 0
+        self.captured = 0
         deadline = time.time() + max_seconds
         try:
-            self.log(f"   打开页面：{url.replace(self.base, '')[:60]}")
+            self.log(f"   打开页面：{url.replace(self.base, '')[:70]}")
             self._goto(url)
+            if after_open:
+                try:
+                    after_open()
+                except Exception as e:  # noqa: BLE001  点筛选失败不影响抓取
+                    self.log(f"   页面操作没成功（{str(e)[:50]}），按默认结果继续")
             for n in range(rounds):
                 if time.time() > deadline:
                     self.log(f"   页面方式已用满 {max_seconds} 秒，停止（拿到 {len(items)} 条）")
@@ -337,8 +360,9 @@ class Douyin:
                     self.log(f"   滚动第 {n} 轮，已拿到 {len(items)} 条")
                 before = len(items)
                 for r in self._drain():
+                    self.captured += 1
                     for aw in extract(r):
-                        aid = str(aw.get("aweme_id") or aw.get("cid") or "")
+                        aid = key(aw)
                         if aid and aid not in seen:
                             seen.add(aid)
                             items.append(aw)
@@ -375,7 +399,59 @@ class Douyin:
                 continue
             if isinstance(data, dict):
                 out.append(data)
+                self._dump(req.url, data)
         return out
+
+    def _dump(self, url: str, data) -> None:
+        if self.raw_dir is None:
+            return
+        try:
+            self.raw_dir.mkdir(parents=True, exist_ok=True)
+            self._raw_n += 1
+            name = re.sub(r"[^A-Za-z0-9]+", "_", urlparse(url).path).strip("_")[-60:]
+            (self.raw_dir / f"{self._raw_n:03d}_{name}.json").write_text(
+                json.dumps({"url": url, "data": data}, ensure_ascii=False, indent=1), encoding="utf-8")
+        except OSError:
+            pass
+
+    # ── 通用小工具（其他平台用）──────────────────
+
+    def goto(self, url: str) -> None:
+        self._goto(url)
+
+    def cookie_names(self, url: str) -> dict:
+        try:
+            return {c.get("name"): c.get("value") for c in self.ctx.cookies(url)}
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def eval(self, js: str, arg=None):
+        """在页面里执行一段 JS，出错返回 None"""
+        try:
+            return self.page.evaluate(js, arg) if arg is not None else self.page.evaluate(js)
+        except Exception:  # noqa: BLE001
+            return None
+
+    def click_text(self, texts: list[str], timeout: int = 2500) -> str:
+        """依次尝试点击页面上写着这些字的元素，返回点中的那个（都点不中返回空串）"""
+        for t in texts:
+            try:
+                el = self.page.get_by_text(t, exact=True).first
+                if el.is_visible(timeout=timeout):
+                    el.click(timeout=timeout)
+                    self.page.wait_for_timeout(1500)
+                    return t
+            except Exception:  # noqa: BLE001
+                continue
+        return ""
+
+    def fetch_json(self, url: str) -> dict:
+        """在当前页面里用 fetch 取 JSON（同源请求，带登录态）"""
+        resp = self.eval("""async (u) => { try { const r = await fetch(u, {credentials: 'include'});
+            return {http: r.status, text: await r.text()}; } catch (e) { return {http: 0, text: ''}; } }""", url)
+        data = classify(resp if isinstance(resp, dict) else {})
+        self._dump(url, data)
+        return data
 
     def _show_window(self) -> None:
         """页面方式需要窗口正常显示，最小化的窗口不会加载新内容"""
@@ -513,19 +589,28 @@ class Douyin:
                 res.items = new
         return res
 
-    def search(self, keyword: str, limit: int) -> Fetch:
+    def search(self, keyword: str, limit: int, by_likes: bool = False, days: int = 0) -> Fetch:
+        """by_likes：按最多点赞排序；days：只要最近多少天（抖音只支持 1 / 7 / 180 天这几档）"""
         from .douyin import awemes_from_search
+
+        sort_type = "1" if by_likes else "0"
+        publish_time = "0" if days <= 0 else "1" if days <= 1 else "7" if days <= 7 else "180"
+        filtered = sort_type != "0" or publish_time != "0"
 
         def page(offset):
             data = self.api(API_SEARCH, {
-                "keyword": keyword, "search_channel": "aweme_video_web", "search_source": "normal_search",
-                "query_correct_type": "1", "is_filter_search": "0", "offset": str(offset), "count": "10",
-                "sort_type": "0", "publish_time": "0", "need_filter_settings": "0", "list_type": "single",
+                "keyword": keyword, "search_channel": "aweme_video_web",
+                "search_source": "tab_search" if filtered else "normal_search",
+                "query_correct_type": "1", "is_filter_search": "1" if filtered else "0",
+                "offset": str(offset), "count": "10", "sort_type": sort_type, "publish_time": publish_time,
+                "need_filter_settings": "0", "list_type": "single",
             })
             items = awemes_from_search(data)
             return items, int(data.get("cursor") or (int(offset) + 10)), bool(data.get("has_more"))
 
         url = f"{self.base}/search/{quote(keyword)}?type=video"
+        if filtered:
+            url += f"&sort_type={sort_type}&publish_time={publish_time}"
         return self._with_fallback(
             "搜索", lambda: self._paged(page, limit),
             lambda: self.page_collect(url, "/aweme/v1/web/search/", awemes_from_search, limit),
@@ -586,6 +671,10 @@ class Douyin:
         """短链接 → 真实地址"""
         self._goto(url)
         final = self.page.url
-        if urlparse(final).hostname != urlparse(self.base).hostname:
+        if urlparse(final).netloc != urlparse(self.base).netloc:
             self._goto(self.base + "/")  # 页面内请求必须在抖音主站页面上发
         return final
+
+
+# 通用名字：其他平台也用这个类（抖音专用的方法留在里面，互不影响）
+Browser = Douyin

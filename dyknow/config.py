@@ -37,6 +37,7 @@ DEFAULTS: dict[str, tuple[object, str]] = {
     "siliconflow_api_key": ("", "云端转录的 API Key（asr=cloud 时需要）"),
     "template": ("general", "AI 整理模板：general / creator / 自定义模板文件路径"),
     "comments": (5, "每条视频附带的热门评论数，0 = 不抓"),
+    "niche": ("", "我的账号方向，比如\"AI 工具和自媒体变现\"，AI 挑选题时会参考"),
     "frames": (0, "每条视频截取多少张画面（给能看图的 AI 用），0 = 不截；建议 8"),
     "update_limit": (200, "update 最多检查多少条最新收藏"),
     "browser": ("auto", "浏览器：auto（依次尝试 Chrome、Edge、内置 Chromium）/ chrome / msedge / chromium"),
@@ -60,6 +61,8 @@ class Config:
     values: dict = field(default_factory=dict)
     # 测试用：替换抖音站点地址
     base_url: str = "https://www.douyin.com"
+    # 测试用：替换其他平台地址，如 {"xhs.www": "http://127.0.0.1:1234"}
+    site_urls: dict = field(default_factory=dict)
 
     @property
     def path(self) -> Path:

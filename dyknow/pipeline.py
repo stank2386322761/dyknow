@@ -93,7 +93,8 @@ class Runner:
                 continue
             file = None
             try:
-                file = media.download(job.video.media_urls, media_dir, job.video.id, require_audio=False)
+                file = media.download(job.video.media_urls, media_dir, job.video.id, require_audio=False,
+                                      referer=job.video.referer)
                 before = stats.frames
                 self.save_frames(job, file, stats)
                 self.log(f"{label} {'✅ 已截图' if stats.frames > before else '⚠️ 没有截到画面'}")
@@ -180,7 +181,8 @@ class Runner:
         def submit(idx: int) -> None:
             if idx < len(jobs) and idx not in futures:
                 j = jobs[idx]
-                futures[idx] = pool.submit(media.download, j.video.media_urls, media_dir, j.video.id)
+                futures[idx] = pool.submit(media.download, j.video.media_urls, media_dir, j.video.id,
+                                           referer=j.video.referer)
 
         done = 0
         try:

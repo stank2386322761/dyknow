@@ -22,10 +22,10 @@ def build(store: Store) -> tuple[str, Counter]:
         rel = i.path.relative_to(store.root)
         groups[" / ".join(rel.parts[:-1]) or "其他"].append(i)
 
-    order = [note.ORGANIZED, note.TRANSCRIBED, note.IMAGE, note.PENDING, note.FAILED, note.NO_SPEECH]
+    order = [note.ORGANIZED, note.TRANSCRIBED, note.READY, note.IMAGE, note.PENDING, note.FAILED, note.NO_SPEECH]
     summary = " · ".join(f"{s} {counts[s]}" for s in order if counts.get(s))
     lines = [
-        "# 抖音知识库索引",
+        "# 知识库索引",
         "",
         f"> 共 {len(infos)} 条" + (f" · {summary}" if summary else "")
         + f"（{datetime.now():%Y-%m-%d %H:%M} 自动生成，不要手动修改）",

@@ -23,9 +23,10 @@ ORGANIZED = "已整理"
 FAILED = "转录失败"
 IMAGE = "图文"
 NO_SPEECH = "无语音"
-STATUSES = (PENDING, TRANSCRIBED, ORGANIZED, FAILED, IMAGE, NO_SPEECH)
-# 等 AI 整理的状态（图文作品有文案，也可以整理）
-TODO_STATUSES = (TRANSCRIBED, IMAGE)
+READY = "待整理"    # 图文类内容（小红书笔记、知乎回答），正文已抓到
+STATUSES = (PENDING, TRANSCRIBED, ORGANIZED, FAILED, IMAGE, NO_SPEECH, READY)
+# 等 AI 整理的状态
+TODO_STATUSES = (TRANSCRIBED, IMAGE, READY)
 
 TEMPLATES_DIR = Path(__file__).parent / "templates"
 _FM_RE = re.compile(r"\A---\r?\n(.*?)\r?\n---\r?\n?", re.DOTALL)
@@ -246,6 +247,37 @@ def render(video: Video, template: str, status: str, comments: list[Comment] | N
     else:
         text = replace_block(text, "transcript", "")
     text = replace_block(text, "comments", comments_block(comments or []))
+    return text
+
+
+def render_item(item, template: str, status: str) -> str:
+    """其他平台（小红书 / 知乎 / B站）的笔记，格式和抖音笔记一致"""
+    meta = [
+        ("id", item.id), ("url", item.url), ("platform", item.platform_name), ("author", item.author),
+        ("published", item.published), ("tags", item.tags), ("status", status),
+    ]
+    head = "---\n" + "\n".join(f"{k}: {_dump(v)}" for k, v in meta) + "\n---\n"
+    bits = [item.platform_name, item.kind or "内容", item.author or "未知作者"]
+    if item.duration_ms:
+        bits.append(fmt_duration(item.duration_ms))
+    if item.published:
+        bits.append(item.published)
+    if item.views:
+        bits.append(f"▶{fmt_count(item.views)}")
+    bits.append(f"👍{fmt_count(item.likes)}")
+    if item.collects:
+        bits.append(f"⭐{fmt_count(item.collects)}")
+    if item.comments:
+        bits.append(f"💬{fmt_count(item.comments)}")
+    bits.append(f"[原文]({item.url})")
+    title = item.title.replace("\n", " ")[:80]
+    text = "\n".join([head, f"# {title}\n", "> " + " · ".join(bits) + "\n", template.strip() + "\n"])
+    body = (item.text or item.excerpt or "").strip()
+    label = "简介" if item.kind == "视频" else "原文"
+    text = replace_block(text, "desc", _callout(label, body.splitlines(), kind="quote", gap=False) if body else "")
+    text = replace_block(text, "frames", "")
+    text = replace_block(text, "transcript", "> [!note]- 转写\n> 待转录" if status == PENDING else "")
+    text = replace_block(text, "comments", "")
     return text
 
 

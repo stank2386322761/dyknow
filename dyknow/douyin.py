@@ -41,6 +41,7 @@ class Video:
     tags: list[str] = field(default_factory=list)
     media_urls: list[str] = field(default_factory=list)
     image_urls: list[str] = field(default_factory=list)   # 图文作品的图片
+    referer: str = ""                                      # 下载时用的来源页（其他平台用）
 
     @property
     def url(self) -> str:

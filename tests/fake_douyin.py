@@ -28,7 +28,7 @@ def make_aweme(i: int, base: str, image: bool = False) -> dict:
     aw = {
         "aweme_id": aid,
         "desc": f"第{i}条视频：AI 工具实测 #AI工具 #效率",
-        "create_time": 1760000000 - i * 86400,
+        "create_time": int(time.time()) - (i + 1) * 86400,
         "author": AUTHOR,
         "statistics": {"digg_count": 12000 + i, "comment_count": 30, "collect_count": 500, "share_count": 9},
         "text_extra": [{"hashtag_name": "AI工具"}, {"hashtag_name": "效率"}],
@@ -71,6 +71,7 @@ class FakeDouyin:
         self.mode = mode
         self.n_favorites = n_favorites
         self.requests: list[str] = []
+        self.queries: list[str] = []
         self.server = ThreadingHTTPServer(("127.0.0.1", 0), self._handler())
         self.base = f"http://127.0.0.1:{self.server.server_address[1]}"
         self.favorites = [make_aweme(i, self.base, image=(i == 3)) for i in range(n_favorites)]
@@ -147,7 +148,12 @@ class FakeDouyin:
                 if u.path.startswith("/aweme/") and "stream" not in u.path:
                     if not self._api_allowed(q):
                         return self._send(200, "")
+                if u.path == "/aweme/v1/web/hot/search/list/":
+                    words = [{"word": f"抖音热点{i}", "hot_value": 11000000 - i * 100000, "label": 3 if i == 0 else 0,
+                              "sentence_id": str(2000 + i)} for i in range(15)]
+                    return self._send(200, json.dumps({"status_code": 0, "data": {"word_list": words}}, ensure_ascii=False))
                 if u.path == "/aweme/v1/web/search/item/":
+                    fake.queries.append(self.path)
                     off = int(q.get("offset", ["0"])[0])
                     items = [{"type": 1, "aweme_info": a} for a in fake.favorites[off:off + 10]]
                     return self._send(200, json.dumps({"status_code": 0, "data": items, "cursor": off + 10,
