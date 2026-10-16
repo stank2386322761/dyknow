@@ -44,7 +44,7 @@ dyknow update                             # 同步新收藏并转录
 | 命令 | 作用 |
 |---|---|
 | `dyknow update` | 同步新收藏并转录（遇到已经有的就停，不会重复处理） |
-| `dyknow link "分享文案"` | 处理分享链接，一次可以传多个 |
+| `dyknow link "分享文案"` | 处理分享链接，一次可以传多个；支持 `/video/`、短链接和 `/shipin/` 专题页主视频 |
 | `dyknow search 关键词 --limit 20` | 搜索视频并转录 |
 | `dyknow creator 主页链接 --limit 30` | 抓博主的作品 |
 | `dyknow transcribe [--retry-failed]` | 继续转录没转完的，或重试失败的 |
@@ -58,6 +58,8 @@ dyknow update                             # 同步新收藏并转录
 | `dyknow config [项] [值]` | 查看 / 修改设置 |
 
 以上命令都加 `--no-transcribe` 时只建笔记、不转录。转录过程中可以随时按 Ctrl+C 停下，下次运行 `dyknow transcribe` 接着做。
+
+`/shipin/` 路径中的编号是专题页编号，程序会读取页面明确标记的主视频，再按真实作品 ID 处理；不会自动选择相关推荐。主视频信息缺失或不唯一时会明确报错。
 
 退出码：`0` 全部成功，`1` 出错，`2` 需要扫码登录，`3` 抖音或浏览器问题，`4` 跑完了但有条目失败或被中断（看 RESULT 里的 `failed` / `pending`）。
 

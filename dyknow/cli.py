@@ -19,7 +19,7 @@ from pathlib import Path
 
 from . import __version__, asr, browser, index, migrate, note
 from .config import DEFAULTS, Config, load
-from .douyin import (Video, find_links, is_short_link, parse_aweme, sec_uid_from_url,
+from .douyin import (Video, find_links, is_shipin_link, is_short_link, parse_aweme, sec_uid_from_url,
                      video_id_from_url)
 from .pipeline import Runner, Stats
 from .store import FOLDER_CREATOR, FOLDER_FAVORITES, FOLDER_LINKS, FOLDER_SEARCH, Store
@@ -312,7 +312,7 @@ def cmd_link(ctx: Ctx, args) -> int:
             if link.isdigit():
                 vid = link
             else:
-                if is_short_link(link):
+                if is_short_link(link) or is_shipin_link(link):
                     url = dy.resolve(link)
                 vid = video_id_from_url(url)
             if not vid:

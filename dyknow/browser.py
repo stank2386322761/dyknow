@@ -20,6 +20,7 @@ from typing import Callable
 from urllib.parse import quote, urlparse
 
 from .config import Config
+from .douyin import is_shipin_link, shipin_video_id_from_html
 
 API_COLLECTION = "/aweme/v1/web/aweme/listcollection/"
 API_SEARCH = "/aweme/v1/web/search/item/"
@@ -668,9 +669,15 @@ class Douyin:
         return out[:limit]
 
     def resolve(self, url: str) -> str:
-        """短链接 → 真实地址"""
+        """短链接或专题页 → 实际作品地址。专题页编号不能直接用作作品 ID。"""
         self._goto(url)
         final = self.page.url
+        if is_shipin_link(final):
+            vid = shipin_video_id_from_html(self.page.content(), final)
+            if not vid:
+                raise BrowserError(BLOCKED, "专题页未找到唯一的主视频信息（未选择相关推荐）；请复制页内主视频的分享链接")
+            final = f"https://www.douyin.com/video/{vid}"
+            self.log(f"   专题页主视频：{final}")
         if urlparse(final).netloc != urlparse(self.base).netloc:
             self._goto(self.base + "/")  # 页面内请求必须在抖音主站页面上发
         return final

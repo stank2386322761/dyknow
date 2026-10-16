@@ -7,10 +7,12 @@
 
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import datetime
-from urllib.parse import parse_qs, urlparse
+from html.parser import HTMLParser
+from urllib.parse import parse_qs, unquote, urlparse
 
 IMAGE_AWEME_TYPES = {2, 68, 150}
 
@@ -207,6 +209,95 @@ def video_id_from_url(url: str) -> str:
         if m:
             return m.group(1)
     return ""
+
+
+def is_shipin_link(url: str) -> bool:
+    """专题页编号不是作品 ID；必须从页面的主视频数据解析。"""
+    parsed = urlparse(url or "")
+    host = (parsed.hostname or "").lower()
+    return (parsed.scheme in ("http", "https")
+            and (host == "douyin.com" or host.endswith(".douyin.com"))
+            and re.fullmatch(r"/shipin/\d{15,25}/?", parsed.path) is not None)
+
+
+def shipin_video_id_from_html(html: str, source_url: str) -> str:
+    """只读取专题页明确的 shipin.mainVideo，不把相关推荐或页面编号当作品。"""
+    if not is_shipin_link(source_url):
+        return ""
+    page_id = urlparse(source_url).path.rstrip("/").rsplit("/", 1)[-1]
+
+    class Scripts(HTMLParser):
+        def __init__(self):
+            super().__init__(convert_charrefs=True)
+            self.in_script = False
+            self.parts: list[str] = []
+            self.scripts: list[str] = []
+
+        def handle_starttag(self, tag, attrs):
+            if tag == "script":
+                self.in_script = True
+                self.parts = []
+
+        def handle_data(self, data):
+            if self.in_script:
+                self.parts.append(data)
+
+        def handle_endtag(self, tag):
+            if tag == "script" and self.in_script:
+                self.scripts.append("".join(self.parts))
+                self.in_script = False
+
+    parser = Scripts()
+    parser.feed(html or "")
+    decoder = json.JSONDecoder()
+    candidates: set[str] = set()
+
+    def find(value, depth=0):
+        if depth > 30:
+            return
+        if isinstance(value, dict):
+            if "shipinID" in value and str(value["shipinID"]) != page_id:
+                return
+            shipin = value.get("shipin")
+            if isinstance(shipin, dict):
+                main = shipin.get("mainVideo")
+                if isinstance(main, dict):
+                    ids = {str(main[k]) for k in ("awemeId", "aweme_id", "itemId")
+                           if main.get(k) is not None}
+                    if main.get("videoUrl"):
+                        vid = video_id_from_url(str(main["videoUrl"]))
+                        if vid:
+                            ids.add(vid)
+                    if len(ids) == 1 and re.fullmatch(r"\d{15,25}", next(iter(ids))):
+                        candidates.update(ids)
+            for child in value.values():
+                find(child, depth + 1)
+        elif isinstance(value, list):
+            for child in value:
+                find(child, depth + 1)
+
+    def decode_payload(text):
+        text = text.strip()
+        if text[:3].lower() in ("%7b", "%5b"):
+            text = unquote(text)
+        text = re.sub(r"^[0-9a-fA-F]+:", "", text, count=1)
+        try:
+            value, _ = decoder.raw_decode(text)
+        except (ValueError, RecursionError):
+            return
+        find(value)
+
+    for script in parser.scripts:
+        decode_payload(script)
+        # React 服务端流：只解码 JSON 数组和字符串，不执行页面脚本。
+        for match in re.finditer(r"(?:self|window)\.__pace_f\.push\(\s*", script):
+            try:
+                chunk, _ = decoder.raw_decode(script, match.end())
+            except (ValueError, RecursionError):
+                continue
+            if isinstance(chunk, list) and len(chunk) > 1 and isinstance(chunk[1], str):
+                decode_payload(chunk[1])
+    return next(iter(candidates)) if len(candidates) == 1 else ""
 
 
 def sec_uid_from_url(url: str) -> str:
