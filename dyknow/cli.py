@@ -45,6 +45,10 @@ class Ctx:
         config_args = [arg for arg in log_args if arg != "--"]
         if config_args[:2] == ["config", "siliconflow_api_key"] and len(config_args) > 2:
             log_args = config_args[:2] + ["[hidden]"]
+        # 手机号、验证码不写进日志
+        log_args = ["[hidden]" if i > 0 and log_args[i - 1] in ("--phone", "--code") else
+                    ("--phone=[hidden]" if a.startswith("--phone=") else "--code=[hidden]" if a.startswith("--code=") else a)
+                    for i, a in enumerate(log_args)]
         self._log.write(f"\n===== {datetime.now():%Y-%m-%d %H:%M:%S} {' '.join(log_args)}\n")
 
     def log(self, msg: str = "") -> None:
@@ -259,6 +263,10 @@ def _remote_result(ctx: Ctx, st: dict, command: str = "login") -> int:
         return ctx.finish(command, OK, "运行 dyknow update 同步收藏（登录后才能看到收藏有多少条）", state=state)
     if state in (remote_login.QR_READY, remote_login.SCANNED):
         qr = st.get("qr", "")
+        if st.get("fallback") == "captcha" and not st.get("qr_refreshed"):
+            ctx.log("⚠️ 发短信时抖音要求滑块验证（远程做不了），已在同一个窗口自动换成扫码登录。")
+        elif st.get("fallback") == "no_form" and not st.get("qr_refreshed"):
+            ctx.log("⚠️ 没找到手机号登录的输入框（抖音页面可能改版），已自动换成扫码登录。")
         if state == remote_login.SCANNED:
             ctx.log("📱 已扫码，等用户在手机上点「确认登录」…")
         elif st.get("qr_refreshed"):
@@ -276,12 +284,26 @@ def _remote_result(ctx: Ctx, st: dict, command: str = "login") -> int:
                           seconds_left=left)
     if state == remote_login.NEED_CODE:
         page = st.get("page", "")
-        if st.get("code_result") == "no_input":
-            ctx.log("⚠️ 页面上没找到填验证码的地方")
-        ctx.log("🔐 抖音要求短信验证" + ("，验证码已发送到用户绑定的手机" if st.get("code_sent") else "") + f"。页面截图：{page}")
-        return ctx.finish(command, WAIT_USER,
-                          "把页面截图发给用户，问他收到的短信验证码，然后运行 dyknow login --code <验证码>",
-                          state=state, page=page)
+        result = st.get("code_result")
+        if st.get("still_waiting"):
+            ctx.log("验证码已提交，抖音还没返回结果。")
+            return ctx.finish(command, WAIT_USER, "运行 dyknow login --wait 等结果", state=state)
+        if result == "wrong":
+            ctx.log("❌ 验证码不对或已过期。")
+            return ctx.finish(command, WAIT_USER, "请用户核对短信里最新的验证码，再运行 dyknow login --code <验证码>",
+                              state=state, code_result=result)
+        if result == "no_input":
+            ctx.log(f"⚠️ 页面上没找到填验证码的地方。页面截图：{page}")
+            return ctx.finish(command, WAIT_USER, "把页面截图发给用户看看卡在哪；或运行 dyknow login --force 重新开始",
+                              state=state, page=page, code_result=result)
+        if st.get("via") == "phone":
+            ctx.log("📩 抖音已发送短信验证码。")
+            return ctx.finish(command, WAIT_USER, "问用户收到的 6 位短信验证码（只要数字），然后运行 dyknow login --code <验证码>",
+                              state=state, via="phone")
+        ctx.log("🔐 扫码后抖音要求身份验证，已选短信方式" + ("并发送验证码" if st.get("code_sent") else "") + "。")
+        nxt = ("问用户收到的 6 位短信验证码，然后运行 dyknow login --code <验证码>" if st.get("code_sent") else
+               "没能自动发短信：把页面截图（page）发给用户，问他看到了什么，再运行 dyknow login --code <验证码>")
+        return ctx.finish(command, WAIT_USER, nxt, state=state, page=page, code_sent=bool(st.get("code_sent")))
     if state == remote_login.CAPTCHA:
         ctx.log("🧩 抖音要求滑块/图形验证，这台电脑上没法远程完成。")
         return ctx.finish(command, PLATFORM, "过 30 分钟再运行 dyknow login --force 试一次；还不行，请用户在自己的电脑上登录",
@@ -295,6 +317,14 @@ def _remote_result(ctx: Ctx, st: dict, command: str = "login") -> int:
         return ctx.finish(command, PLATFORM, NEXT_STEP.get(reason, ""), state=state, reason=reason, detail=detail)
     ctx.log(f"❌ 登录没能完成：{detail}")
     return ctx.finish(command, ERROR, "运行 dyknow login 重新开始", state=state, reason=reason, detail=detail)
+
+
+def _clean_phone(raw: str) -> str:
+    import re as _re
+    digits = _re.sub(r"\D", "", raw)
+    if digits.startswith("86") and len(digits) == 13:
+        digits = digits[2:]
+    return digits if _re.fullmatch(r"1\d{10}", digits) else ""
 
 
 def cmd_login(ctx: Ctx, args) -> int:
@@ -314,6 +344,13 @@ def cmd_login(ctx: Ctx, args) -> int:
                               state=st.get("state"), qr=st.get("qr", ""))
         return _remote_result(ctx, st)
     site = getattr(args, "site", "") or ""
+    phone = _clean_phone(getattr(args, "phone", "") or "")
+    if getattr(args, "phone", "") and not phone:
+        ctx.log("❌ 手机号格式不对，需要 11 位中国大陆手机号")
+        return ctx.finish("login", ERROR, "请用户重新提供手机号；或不带 --phone 运行 dyknow login 改用扫码", reason="bad_phone")
+    if not site and phone:
+        ctx.log(f"正在打开抖音登录页，给 {phone[:3]}****{phone[-4:]} 发短信验证码…")
+        return _remote_result(ctx, remote_login.start(ctx.cfg, force=args.force, phone=phone))
     if not site and (getattr(args, "qr", False) or not browser.has_display()):
         ctx.log("这台电脑没有可以给你看的屏幕，改用「二维码图片」登录：正在打开抖音登录页…"
                 if not getattr(args, "qr", False) else "正在打开抖音登录页，生成二维码图片…")
@@ -698,6 +735,7 @@ def build_parser() -> argparse.ArgumentParser:
 常用：
   dyknow login                     扫码登录（只需一次；没有屏幕时自动生成二维码图片）
   dyknow login --wait              手机扫完二维码图片后，等登录完成
+  dyknow login --phone 138xxxx     不扫码：手机号 + 短信验证码登录（再运行 dyknow login --code 123456）
   dyknow update                    同步新收藏并转录
   dyknow link "分享文案或链接"       处理单个视频
   dyknow search 关键词 --limit 20   搜索并转录
@@ -715,6 +753,7 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("login", help="扫码登录（只需一次）")
     s.add_argument("--force", action="store_true", help="清除登录状态重新扫码（换账号用）")
     s.add_argument("--site", default="", help="登录其他平台：xhs（小红书）/ zhihu（知乎）/ bili（B站），不填 = 抖音")
+    s.add_argument("--phone", default="", help="用手机号 + 短信验证码登录（不用扫码；遇到滑块验证会自动改成扫码）")
     s.add_argument("--qr", action="store_true", help="把二维码存成图片（手机 / 云电脑用；没有屏幕时自动启用）")
     s.add_argument("--wait", action="store_true", help="等用户扫完二维码图片")
     s.add_argument("--timeout", type=int, default=240, help="--wait 最多等多少秒（默认 240）")

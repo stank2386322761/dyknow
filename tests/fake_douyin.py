@@ -69,15 +69,34 @@ window.addEventListener('scroll', () => more());
 LOGIN_PAGE = """<html><body>
 <div>douyin home</div><button id="login" onclick="openLogin()">登录</button>
 <div id="dlg" style="display:none;padding:30px;background:#fff">
-  <p>扫码登录</p><p id="tip">打开抖音App扫码</p>
-  <div class="qrcode-wrapper"><img id="qr" width="180" height="180"></div>
+  <span onclick="tab('qrbox')">扫码登录</span> <span onclick="tab('smsbox')">验证码登录</span>
+  <div id="qrbox"><p>扫码登录</p><p id="tip">打开抖音App扫码</p>
+    <div class="qrcode-wrapper"><img id="qr" width="180" height="180"></div></div>
+  <div id="smsbox" style="display:none">
+    <input id="phone" placeholder="请输入手机号" type="tel">
+    <input id="pcode" placeholder="请输入验证码" maxlength="6">
+    <span onclick="sendSms()">获取验证码</span>
+    <label><input type="checkbox" id="agree"> 我已阅读并同意用户协议</label>
+    <button onclick="phoneLogin()">登录</button><p id="tip2"></p>
+  </div>
 </div>
+<div id="slider" style="display:none">请完成下列验证后继续 拖动滑块</div>
 <div id="verify" style="display:none">
-  <p>身份验证</p><input id="code" placeholder="请输入验证码" maxlength="6">
-  <span onclick="sent=true">获取验证码</span><button onclick="submitCode()">验证</button>
+  <p>身份验证</p><span onclick="smsOpt=true">接收短信验证码</span>
+  <input id="code" placeholder="请输入验证码" maxlength="6">
+  <span onclick="fetch('/test/send?p=bound')">获取验证码</span><button onclick="submitCode()">验证</button>
 </div>
 <script>
-let gen = 0, sent = false;
+let gen = 0, smsOpt = false;
+function tab(id) { for (const t of ['qrbox', 'smsbox']) document.getElementById(t).style.display = t === id ? 'block' : 'none'; }
+async function sendSms() {
+  const d = await (await fetch('/test/send?p=' + document.getElementById('phone').value
+    + '&agree=' + document.getElementById('agree').checked)).json();
+  if (d.captcha) { document.getElementById('slider').style.display = 'block';
+    document.addEventListener('keydown', e => { if (e.key === 'Escape') document.getElementById('slider').style.display = 'none'; }); } }
+async function phoneLogin() {
+  const d = await (await fetch('/test/code?c=' + document.getElementById('pcode').value)).json();
+  if (d.ok) document.cookie = 'sessionid=abc; path=/; max-age=86400'; else document.getElementById('tip2').textContent = '验证码错误'; }
 function qrSrc(g) { return 'data:image/svg+xml;utf8,' + encodeURIComponent(
   '<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180"><rect width="180" height="180" fill="#fff"/>'
   + '<rect x="10" y="10" width="' + (40 + g * 10) + '" height="60" fill="#000"/></svg>'); }
@@ -105,6 +124,8 @@ class FakeDouyin:
         self.login_page = login_page
         self.qr_state = "waiting"   # waiting / scanned / confirmed / expired / verify
         self.sms_code = "123456"
+        self.sms_to: list = []        # 发过短信的 (手机号, 是否勾了协议)
+        self.send_captcha = False     # 发短信时弹滑块
         self.mode = mode
         self.n_favorites = n_favorites
         self.requests: list[str] = []
@@ -229,6 +250,9 @@ more(); window.addEventListener('scroll', more);
                 if u.path == "/test/refresh":
                     fake.qr_state = "waiting"
                     return self._send(200, "{}")
+                if u.path == "/test/send":
+                    fake.sms_to.append((q.get("p", [""])[0], q.get("agree", [""])[0]))
+                    return self._send(200, json.dumps({"captcha": fake.send_captcha}))
                 if u.path == "/test/code":
                     ok = q.get("c", [""])[0] == fake.sms_code
                     return self._send(200, json.dumps({"ok": ok}))

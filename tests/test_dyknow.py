@@ -881,3 +881,34 @@ class TestRemoteLogin(unittest.TestCase):
             code, out, res = run_cli(["login", "--wait", "--timeout", "3"], self.cfg)
             self.assertEqual(code, cli.WAIT_USER, out)
             self.assertIn("扫了没有", out)
+
+    def test_phone_sms_login_without_scan(self):
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            code, out, res = run_cli(["login", "--phone", "+86 138-0013-8000"], self.cfg)
+            self.assertEqual((code, res["state"], res.get("via")), (cli.WAIT_USER, "need_code", "phone"), out)
+            self.assertEqual(fake.sms_to, [("13800138000", "true")])
+            self.assertNotIn("13800138000", out)
+            code, out, res = run_cli(["login", "--code", "000000"], self.cfg)
+            self.assertEqual((code, res.get("code_result")), (cli.WAIT_USER, "wrong"), out)
+            code, out, res = run_cli(["login", "--code", "123456"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
+            log = (self.cfg.logs_dir / "dyknow.log").read_text(encoding="utf-8")
+            self.assertNotIn("13800138000", log)
+            self.assertNotIn("123456", log)
+
+    def test_phone_captcha_falls_back_to_qr(self):
+        with FakeDouyin(5, login_page=True) as fake:
+            fake.send_captcha = True
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            code, out, res = run_cli(["login", "--phone", "13800138000"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.WAIT_USER, "qr_ready"), out)
+            self.assertIn("自动换成扫码", out)
+            fake.qr_state = "confirmed"
+            code, out, res = run_cli(["login", "--wait", "--timeout", "30"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
+
+    def test_bad_phone(self):
+        self.cfg = make_cfg(tmpdir())
+        code, out, res = run_cli(["login", "--phone", "12345"], self.cfg)
+        self.assertEqual((code, res["reason"]), (cli.ERROR, "bad_phone"), out)

@@ -37,6 +37,7 @@ dyknow doctor                   # 检查环境：显卡能不能用、浏览器�
 dyknow config output_dir "D:/抖音知识库"   # 笔记存哪（Obsidian 仓库里的一个文件夹就行）
 dyknow login                              # 弹出浏览器，用抖音 App 扫码，只需一次
                                           # 没有屏幕（云电脑 / 手机上用 AI）时自动生成二维码图片，扫完运行 dyknow login --wait
+dyknow login --phone 13800138000          # 不扫码：发短信验证码，再运行 dyknow login --code 123456
 dyknow update                             # 同步新收藏并转录
 ```
 

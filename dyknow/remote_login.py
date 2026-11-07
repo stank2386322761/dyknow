@@ -73,6 +73,8 @@ _EXPIRED = ("二维码已失效", "二维码已过期", "二维码失效", "已�
 _SCANNED = ("扫码成功", "已扫码", "请在手机上确认", "在手机上确认", "确认登录")
 _NEED_CODE = ("身份验证", "安全验证", "短信验证", "输入验证码", "请输入验证码", "接收短信")
 _SEND_CODE = ["获取验证码", "发送验证码", "获取短信验证码"]
+_SMS_OPTION = ["接收短信验证码", "短信验证码", "短信验证", "发送短信验证码", "手机短信验证"]
+_WRONG_CODE = ("验证码错误", "验证码不正确", "验证码有误", "验证码已过期", "验证码已失效")
 _SUBMIT = ["验证", "确定", "确认", "提交", "下一步", "登录"]
 
 
@@ -141,7 +143,7 @@ def _stop_worker(cfg: Config) -> None:
 # ── 前台：启动 / 等待 / 填验证码 ─────────────────
 
 
-def start(cfg: Config, force: bool = False, wait_qr: int = 90) -> dict:
+def start(cfg: Config, force: bool = False, wait_qr: int = 90, phone: str = "") -> dict:
     """后台开浏览器去拿二维码，拿到（或已登录、或出错）就返回状态"""
     _stop_worker(cfg)
     d = state_dir(cfg)
@@ -151,8 +153,12 @@ def start(cfg: Config, force: bool = False, wait_qr: int = 90) -> dict:
             (d / name).unlink()
         except OSError:
             pass
-    job = {"home": str(cfg.home), "values": cfg.values, "base_url": cfg.base_url, "force": force}
+    job = {"home": str(cfg.home), "values": cfg.values, "base_url": cfg.base_url, "force": force, "phone": phone}
     (d / "job.json").write_text(json.dumps(job, ensure_ascii=False), encoding="utf-8")
+    try:
+        os.chmod(d / "job.json", 0o600)
+    except OSError:
+        pass
     _write_status(cfg, state=STARTING)
     log = open(d / "worker.log", "a", encoding="utf-8")
     kwargs: dict = dict(stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=str(d))
@@ -188,15 +194,16 @@ def wait(cfg: Config, timeout: int = 240, seen_qr: int | None = None) -> dict:
         return {"state": ERROR, "reason": "not_started", "detail": "还没有开始登录"}
     start_qr = st.get("qr_version", 0) if seen_qr is None else seen_qr
     start_state = st.get("state")
+    start_code = st.get("code_result")
     deadline = time.time() + timeout
     while True:
         st = read_status(cfg)
         state = st.get("state")
         if state in FINAL:
             return st
-        if state == NEED_CODE and (start_state != NEED_CODE or st.get("code_result")):
+        if state == NEED_CODE and (start_state != NEED_CODE or st.get("code_result") != start_code):
             return st
-        if state in (QR_READY, SCANNED) and st.get("qr_version", 0) != start_qr:
+        if state in (QR_READY, SCANNED) and (st.get("qr_version", 0) != start_qr or start_state == NEED_CODE):
             st["qr_refreshed"] = True
             return st
         if not _alive(st.get("pid")):
@@ -216,12 +223,25 @@ def submit_code(cfg: Config, code: str, timeout: int = 60) -> dict:
     if st.get("state") != NEED_CODE or not _alive(st.get("pid")):
         return {"state": st.get("state") or ERROR, "reason": "no_code_needed",
                 "detail": "现在不需要验证码（或登录已结束）"}
+    tries = st.get("code_try", 0)
     d = state_dir(cfg)
     (d / "code.txt").write_text(code.strip(), encoding="utf-8")
-    deadline = time.time() + 20
-    while time.time() < deadline and (d / "code.txt").exists():
-        time.sleep(0.5)
-    return wait(cfg, timeout, seen_qr=st.get("qr_version", 0))
+    deadline = time.time() + timeout
+    while True:
+        st = read_status(cfg)
+        if st.get("state") in FINAL:
+            return st
+        if st.get("code_try", 0) > tries and st.get("code_result") in ("wrong", "no_input"):
+            return st
+        if st.get("state") in (QR_READY, SCANNED) and st.get("code_try", 0) > tries:
+            return st
+        if not _alive(st.get("pid")):
+            return read_status(cfg) if read_status(cfg).get("state") in FINAL else \
+                {"state": ERROR, "reason": "worker_gone", "detail": "后台登录进程已经不在了，需要重新开始"}
+        if time.time() >= deadline:
+            st["still_waiting"] = True
+            return st
+        time.sleep(1)
 
 
 # ── 后台进程 ──────────────────────────────────
@@ -229,6 +249,10 @@ def submit_code(cfg: Config, code: str, timeout: int = 60) -> dict:
 
 def run_worker(job_path: str, log: Callable[[str], None] = print) -> int:
     job = json.loads(Path(job_path).read_text(encoding="utf-8"))
+    try:
+        Path(job_path).unlink()   # 里面有手机号，读完就删
+    except OSError:
+        pass
     cfg = Config(home=Path(job["home"]), values=job.get("values") or {})
     cfg.base_url = job.get("base_url") or cfg.base_url
     base = dict(pid=os.getpid())
@@ -237,7 +261,7 @@ def run_worker(job_path: str, log: Callable[[str], None] = print) -> int:
         dy = browser.Douyin(cfg, headless=False, log=log)
         dy.scale = 2
         with dy:
-            return _work(cfg, dy, bool(job.get("force")), base, log)
+            return _work(cfg, dy, bool(job.get("force")), base, log, phone=str(job.get("phone") or ""))
     except browser.BrowserError as e:
         _write_status(cfg, **base, state=ERROR, reason=e.reason,
                       detail=browser.REASON_TEXT.get(e.reason, e.reason) + (f"（{e.detail}）" if e.detail else ""))
@@ -248,7 +272,7 @@ def run_worker(job_path: str, log: Callable[[str], None] = print) -> int:
         return 1
 
 
-def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log) -> int:
+def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log, phone: str = "") -> int:
     d = state_dir(cfg)
     if dy.logged_in() and not force:
         try:
@@ -266,20 +290,42 @@ def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log) -> in
         dy.page.wait_for_timeout(2000)
 
     deadline = time.time() + WORKER_SECONDS
-    qr_version, qr_sig, state = 0, None, STARTING
-    code_result = ""
-    sent_code = False
     dy.open_login_dialog()
-    dy.page.wait_for_timeout(2000)
+    dy.page.wait_for_timeout(1500)
+
+    mode, fallback = "qr", ""
+    if phone:
+        sent = _send_phone_code(dy, phone)
+        if sent == "sent":
+            mode = "phone"
+        else:
+            # 抖音要滑块，或者找不到手机号输入框：同一个浏览器里直接换成扫码，不用用户重来
+            fallback = sent
+            _close_overlays(dy)
+            dy.click_text(["扫码登录", "二维码登录"])
+            dy.page.wait_for_timeout(1500)
+
+    qr_version, qr_sig = 0, None
+    last_written: dict = {}
+    code_result, sms_sent, code_try = "", mode == "phone", 0
+
+    def publish(state: str, **extra) -> None:
+        key = {"state": state, "qr_version": qr_version, "code_result": code_result, "code_try": code_try}
+        if key != last_written:
+            last_written.clear()
+            last_written.update(key)
+            _write_status(cfg, **base, state=state, via=mode, fallback=fallback, expires_at=deadline,
+                          code_result=code_result, code_try=code_try, **extra)
+
     while time.time() < deadline:
         if dy.logged_in():
             dy.page.wait_for_timeout(3000)
-            _write_status(cfg, **base, state=LOGGED_IN)
+            _write_status(cfg, **base, state=LOGGED_IN, via=mode)
             return 0
         text = dy.eval(_TEXT_JS) or ""
         if any(k in text for k in _CAPTCHA):
             _shot(dy, d / "page.png")
-            _write_status(cfg, **base, state=CAPTCHA, page=str(d / "page.png"))
+            _write_status(cfg, **base, state=CAPTCHA, via=mode, page=str(d / "page.png"))
             return 1
 
         code_file = d / "code.txt"
@@ -288,6 +334,16 @@ def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log) -> in
             code_file.unlink()
             code_result = "filled" if _fill_code(dy, code) else "no_input"
             dy.page.wait_for_timeout(3000)
+            if not dy.logged_in() and any(k in (dy.eval(_TEXT_JS) or "") for k in _WRONG_CODE):
+                code_result = "wrong"
+            code_try += 1
+            continue
+
+        if mode == "phone":
+            # 手机号登录：等用户报验证码；验证码过期了允许再发一次
+            _shot(dy, d / "page.png")
+            publish(NEED_CODE, code_sent=True, page=str(d / "page.png"))
+            dy.page.wait_for_timeout(1500)
             continue
 
         qr = dy.eval(_FIND_QR_JS)
@@ -301,36 +357,83 @@ def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log) -> in
                 _shot(dy, d / "qr.png", qr)
                 qr_sig = qr["sig"]
                 qr_version += 1
-            new_state = SCANNED if any(k in text for k in _SCANNED) else QR_READY
-        elif any(k in text for k in _NEED_CODE) and qr_version:
-            if not sent_code:
-                sent_code = bool(dy.click_text(_SEND_CODE))
+            state = SCANNED if any(k in text for k in _SCANNED) else QR_READY
+            publish(state, qr=str(d / "qr.png"), qr_version=qr_version, qr_exact=True)
+        elif qr_version and any(k in text for k in _NEED_CODE):
+            # 扫码后抖音风控要「身份验证」：同一个会话里默认选短信，自动点发送
+            if not sms_sent:
+                dy.click_text(_SMS_OPTION, timeout=1500)
+                sms_sent = bool(dy.click_text(_SEND_CODE, timeout=1500))
+                _agree(dy)
             _shot(dy, d / "page.png")
-            new_state = NEED_CODE
+            publish(NEED_CODE, code_sent=sms_sent, page=str(d / "page.png"), qr_version=qr_version)
         else:
-            # 没找到二维码：可能登录框没弹出来，再点一次；同时整页截图兜底
             dy.open_login_dialog()
             dy.page.wait_for_timeout(1500)
             if not dy.eval(_FIND_QR_JS) and not qr_version:
+                # 实在找不到二维码：整页截图兜底（二维码在图里）
                 _shot(dy, d / "qr.png")
                 qr_version += 1
                 qr_sig = "page"
-                new_state = QR_READY
-            else:
-                continue
-        if new_state != state or new_state in (QR_READY, SCANNED, NEED_CODE):
-            state = new_state
-            extra = {"qr": str(d / "qr.png"), "qr_version": qr_version, "qr_exact": qr_sig != "page",
-                     "expires_at": deadline}
-            if state == NEED_CODE:
-                extra.update(page=str(d / "page.png"), code_sent=sent_code, code_result=code_result)
-            prev = read_status(cfg)
-            if {k: prev.get(k) for k in ("state", "qr_version", "code_result")} != \
-                    {"state": state, "qr_version": qr_version, "code_result": code_result}:
-                _write_status(cfg, **base, state=state, **extra)
-        dy.page.wait_for_timeout(2000)
-    _write_status(cfg, **base, state=TIMEOUT)
+                publish(QR_READY, qr=str(d / "qr.png"), qr_version=qr_version, qr_exact=False)
+            continue
+        dy.page.wait_for_timeout(1500)
+    _write_status(cfg, **base, state=TIMEOUT, via=mode)
     return 1
+
+
+def _send_phone_code(dy: "browser.Douyin", phone: str) -> str:
+    """在登录框里切到「验证码登录」，填手机号，点「获取验证码」。返回 sent / captcha / no_form"""
+    dy.click_text(["验证码登录", "手机号登录", "短信登录", "手机验证码登录"])
+    dy.page.wait_for_timeout(800)
+    found = dy.eval("""() => {
+      const ok = el => { const r = el.getBoundingClientRect(); return r.width > 40 && r.height > 10
+        && getComputedStyle(el).visibility !== 'hidden'; };
+      const el = [...document.querySelectorAll('input')].filter(ok).find(el =>
+        /手机号|手机号码|phone|mobile/i.test((el.placeholder || '') + (el.name || '') + (el.getAttribute('aria-label') || ''))
+        || el.type === 'tel');
+      if (!el) return false;
+      el.setAttribute('data-dyknow-phone', '1');
+      return true;
+    }""")
+    if not found:
+        return "no_form"
+    try:
+        box = dy.page.locator("[data-dyknow-phone='1']").first
+        box.click(timeout=3000)
+        box.fill("")
+        box.type(phone, delay=60)
+    except Exception:  # noqa: BLE001
+        return "no_form"
+    _agree(dy)
+    if not dy.click_text(_SEND_CODE):
+        return "no_form"
+    _agree(dy)  # 有的版本点了发送才弹「同意协议」
+    dy.page.wait_for_timeout(2000)
+    text = dy.eval(_TEXT_JS) or ""
+    if any(k in text for k in _CAPTCHA):
+        return "captcha"
+    return "sent"
+
+
+def _agree(dy: "browser.Douyin") -> None:
+    """登录需要勾选用户协议：弹窗就点「同意」，没弹就勾上协议旁的选框（用户要求登录即视为同意）"""
+    if dy.click_text(["同意并继续", "同意并登录", "同意并发送"], timeout=800):
+        return
+    dy.eval("""() => {
+      for (const el of document.querySelectorAll('input[type=checkbox]')) {
+        const t = (el.closest('label, div') || el).innerText || '';
+        if (/协议|同意/.test(t) && !el.checked) { el.click(); }
+      }
+    }""")
+
+
+def _close_overlays(dy: "browser.Douyin") -> None:
+    try:
+        dy.page.keyboard.press("Escape")
+        dy.page.wait_for_timeout(500)
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _shot(dy: "browser.Douyin", path: Path, box: dict | None = None) -> None:
@@ -370,5 +473,22 @@ def _fill_code(dy: "browser.Douyin", code: str) -> bool:
     except Exception:  # noqa: BLE001
         return False
     dy.page.wait_for_timeout(800)
-    dy.click_text(_SUBMIT)
+    try:
+        box.press("Enter")
+        dy.page.wait_for_timeout(1500)
+    except Exception:  # noqa: BLE001
+        pass
+    if not dy.logged_in():
+        # 先找验证码输入框附近的提交按钮（页面顶部也有个「登录」，不能点错）
+        clicked = dy.eval("""(names) => {
+          let p = document.querySelector("[data-dyknow-code='1']");
+          for (let i = 0; p && i < 8; i++, p = p.parentElement) {
+            const btn = [...p.querySelectorAll('button, [role=button], div, span')].find(el =>
+              names.includes((el.innerText || '').trim()) && el.getBoundingClientRect().width > 20);
+            if (btn) { btn.click(); return true; }
+          }
+          return false;
+        }""", _SUBMIT)
+        if not clicked:
+            dy.click_text(_SUBMIT)
     return True
