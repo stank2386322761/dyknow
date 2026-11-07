@@ -809,3 +809,75 @@ class TestSearchDoesNotHang(unittest.TestCase):
             self.assertLess(time.time() - t0, 60, logs)
             self.assertEqual((res.via, len(res.items)), ("page", 15), logs)
             self.assertTrue(any("打开页面" in m for m in logs), "要有阶段日志，卡住时能看出卡在哪")
+
+
+# ── 手机 / 云电脑登录（二维码图片）──────────────
+
+
+class TestRemoteLogin(unittest.TestCase):
+    def setUp(self):
+        os.environ["DYKNOW_REMOTE"] = "1"   # 假装没有屏幕
+        os.environ["DYKNOW_NO_AUTO_INSTALL"] = "1"
+
+    def tearDown(self):
+        os.environ.pop("DYKNOW_REMOTE", None)
+        from dyknow import remote_login
+        remote_login._stop_worker(self.cfg)
+
+    def _wait_qr_requests(self, fake, n=1):
+        deadline = time.time() + 20
+        while time.time() < deadline and fake.requests.count("/test/qrstatus") < n:
+            time.sleep(0.3)
+
+    def test_qr_image_then_scan_and_confirm(self):
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            code, out, res = run_cli(["login"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.WAIT_USER, "qr_ready"), out)
+            qr = Path(res["qr"])
+            self.assertTrue(qr.exists() and qr.stat().st_size > 500, out)
+            from PIL import Image
+            w, h = Image.open(qr).size
+            self.assertTrue(300 < w < 600 and abs(w - h) < 10, (w, h))  # 只裁二维码，2 倍清晰度
+
+            fake.qr_state = "expired"
+            code, out, res = run_cli(["login", "--wait", "--timeout", "30"], self.cfg)
+            self.assertEqual((code, res["qr_refreshed"]), (cli.WAIT_USER, True), out)
+
+            fake.qr_state = "scanned"
+            time.sleep(4)
+            fake.qr_state = "confirmed"
+            code, out, res = run_cli(["login", "--wait", "--timeout", "60"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
+
+            code, out, res = run_cli(["update", "--no-transcribe"], self.cfg)
+            self.assertIn(code, (cli.OK, cli.PARTIAL), out)
+            self.assertEqual(res["found"], 5, out)
+
+    def test_sms_verification(self):
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            code, out, res = run_cli(["login"], self.cfg)
+            self.assertEqual(code, cli.WAIT_USER, out)
+            fake.qr_state = "verify"
+            code, out, res = run_cli(["login", "--wait", "--timeout", "30"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.WAIT_USER, "need_code"), out)
+            self.assertTrue(Path(res["page"]).exists())
+            code, out, res = run_cli(["login", "--code", "123456"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
+
+    def test_already_logged_in(self):
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            login_cookie(self.cfg)
+            code, out, res = run_cli(["login"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
+            self.assertIn("已经是登录状态", out)
+
+    def test_wait_timeout_keeps_waiting(self):
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            run_cli(["login"], self.cfg)
+            code, out, res = run_cli(["login", "--wait", "--timeout", "3"], self.cfg)
+            self.assertEqual(code, cli.WAIT_USER, out)
+            self.assertIn("扫了没有", out)

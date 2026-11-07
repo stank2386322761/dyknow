@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "dyknow"
-version = "3.2.0"
+version = "3.3.0"
 description = "抖音收藏 → 转录 → 本地 Markdown 知识库；抖音、小红书、知乎、B站、微博热榜和高赞内容找选题"
 readme = "README.md"
 license = { text = "MIT" }

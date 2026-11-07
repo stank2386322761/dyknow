@@ -10,10 +10,14 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import random
 import re
+import shutil
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from typing import Callable
@@ -42,6 +46,98 @@ REASON_TEXT = {
     BUSY: "登录用的浏览器目录正被占用（另一个 dyknow 正在运行，或上次的浏览器窗口没关）",
     NO_BROWSER: "找不到可用的浏览器（需要 Chrome、Edge，或运行 playwright install chromium）",
 }
+
+
+# ── 没有屏幕的电脑（云电脑、服务器、AI 沙箱）──────────────
+
+_XVFB: subprocess.Popen | None = None
+
+
+def has_display() -> bool:
+    """这台电脑上有没有用户能看到的屏幕。Windows / macOS 视为有；Linux 看 DISPLAY 对应的 X 服务是否真的在。"""
+    if os.environ.get("DYKNOW_REMOTE", "").strip() in ("1", "true", "yes"):
+        return False
+    if not sys.platform.startswith("linux"):
+        return True
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return True
+    d = os.environ.get("DISPLAY", "").strip()
+    m = re.match(r"^([^:]*):(\d+)", d)
+    if not m:
+        return False
+    if m.group(1) and m.group(1) not in ("unix",):   # 远程 X（如 SSH 转发）：相信它
+        return True
+    return os.path.exists(f"/tmp/.X11-unix/X{m.group(2)}")
+
+
+def start_virtual_display() -> bool:
+    """有 Xvfb 就开一个虚拟屏幕（浏览器照常"有窗口"地运行，抖音不容易拦），成功返回 True"""
+    global _XVFB
+    if _XVFB is not None and _XVFB.poll() is None:
+        return True
+    xvfb = shutil.which("Xvfb")
+    if not xvfb:
+        return False
+    for n in range(99, 130):
+        if os.path.exists(f"/tmp/.X11-unix/X{n}") or os.path.exists(f"/tmp/.X{n}-lock"):
+            continue
+        try:
+            proc = subprocess.Popen([xvfb, f":{n}", "-screen", "0", "1366x900x24", "-nolisten", "tcp"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, stdin=subprocess.DEVNULL)
+        except OSError:
+            return False
+        for _ in range(50):
+            if os.path.exists(f"/tmp/.X11-unix/X{n}"):
+                os.environ["DISPLAY"] = f":{n}"
+                _XVFB = proc
+                atexit.register(_stop_virtual_display)
+                return True
+            if proc.poll() is not None:
+                break
+            time.sleep(0.1)
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+    return False
+
+
+def _stop_virtual_display() -> None:
+    global _XVFB
+    if _XVFB is not None:
+        try:
+            _XVFB.terminate()
+        except OSError:
+            pass
+        _XVFB = None
+
+
+def install_browser(log: Callable[[str], None] = print) -> bool:
+    """自动安装 Playwright 自带的 Chromium（Linux 上有权限时连同系统依赖和 Xvfb 一起装）"""
+    if os.environ.get("DYKNOW_NO_AUTO_INSTALL", "").strip() in ("1", "true", "yes"):
+        return False
+    base = [sys.executable, "-m", "playwright", "install"]
+    tries = []
+    if sys.platform.startswith("linux") and hasattr(os, "geteuid") and os.geteuid() == 0:
+        tries.append(base + ["--with-deps", "chromium"])
+    tries.append(base + ["chromium"])
+    log("⏳ 没找到可用的浏览器，正在自动安装 Chromium（只需一次，约 1-5 分钟）…")
+    for cmd in tries:
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=1200)
+        except (OSError, subprocess.TimeoutExpired):
+            continue
+        if r.returncode == 0:
+            log("✅ Chromium 安装完成")
+            return True
+    log("❌ Chromium 自动安装失败")
+    return False
+
+
+def _missing_browser(err: str) -> bool:
+    low = err.lower()
+    return any(k in low for k in ("executable doesn't exist", "playwright install", "missing dependencies",
+                                  "error while loading shared libraries", "is not found at"))
 
 _SCROLL_JS = """() => {
   for (const el of document.querySelectorAll('div, section, main, ul')) {
@@ -198,6 +294,8 @@ class Douyin:
         self._responses: list = []
         self.channel_used = ""
         self._lock: ProfileLock | None = None
+        self.window_visible = False  # 用户能不能真的看到这个浏览器窗口（云电脑上是 False）
+        self.scale = 1               # 页面像素倍数，截二维码时用 2 让图更清楚
 
     # ── 生命周期 ──────────────────────────────
 
@@ -215,30 +313,15 @@ class Douyin:
         self._lock = ProfileLock(self.cfg.home / "browser.lock")
         self._lock.acquire()
         self._pw = sync_playwright().start()
-        pref = str(self.cfg.get("browser") or "auto")
-        channels = ["chrome", "msedge", None] if pref == "auto" else [None if pref == "chromium" else pref]
-        last_err = ""
-        for ch in channels:
-            kwargs = dict(
-                user_data_dir=str(self.cfg.profile_dir),
-                headless=bool(self.headless),
-                viewport={"width": 1280, "height": 860},
-                locale="zh-CN",
-                args=["--disable-blink-features=AutomationControlled"],
-                ignore_default_args=["--enable-automation"],
-            )
-            if ch:
-                kwargs["channel"] = ch
-            try:
-                self.ctx = self._pw.chromium.launch_persistent_context(**kwargs)
-                self.channel_used = ch or "chromium"
+        installed = False
+        while True:
+            self._decide_window()
+            last_err = self._launch()
+            if self.ctx is not None or installed or not _missing_browser(last_err):
                 break
-            except Exception as e:  # noqa: BLE001
-                last_err = str(e)
-                low = last_err.lower()
-                if any(k in low for k in ("singleton", "already in use", "existing browser session")):
-                    self.close()
-                    raise BrowserError(BUSY)
+            installed = True
+            if not install_browser(self.log):
+                break
         if self.ctx is None:
             self.close()
             raise BrowserError(NO_BROWSER, last_err.splitlines()[0][:120] if last_err else "")
@@ -252,6 +335,61 @@ class Douyin:
         except BaseException:
             self.close()
             raise
+
+    def _decide_window(self) -> None:
+        """要窗口但这台电脑没有屏幕：先用虚拟屏幕（Xvfb），没有再退回无窗口模式"""
+        self.window_visible = False
+        if self.headless:
+            return
+        if has_display():
+            self.window_visible = True
+        elif not start_virtual_display():
+            self.headless = True
+
+    def _launch(self) -> str:
+        """按偏好依次试浏览器，成功后 self.ctx 不为空；返回最后一个错误"""
+        pref = str(self.cfg.get("browser") or "auto")
+        channels = ["chrome", "msedge", None] if pref == "auto" else [None if pref == "chromium" else pref]
+        last_err = ""
+        for ch in channels:
+            kwargs = dict(
+                user_data_dir=str(self.cfg.profile_dir),
+                headless=bool(self.headless),
+                viewport={"width": 1280, "height": 860},
+                locale="zh-CN",
+                args=["--disable-blink-features=AutomationControlled"],
+                ignore_default_args=["--enable-automation"],
+                env=dict(os.environ),  # 虚拟屏幕的 DISPLAY 是启动后才设置的，要显式传给浏览器
+            )
+            if self.scale != 1:
+                kwargs["device_scale_factor"] = self.scale
+            if ch:
+                kwargs["channel"] = ch
+            try:
+                self.ctx = self._pw.chromium.launch_persistent_context(**kwargs)
+                self.channel_used = ch or "chromium"
+            except Exception as e:  # noqa: BLE001
+                last_err = str(e)
+                low = last_err.lower()
+                if any(k in low for k in ("singleton", "already in use", "existing browser session")):
+                    self.close()
+                    raise BrowserError(BUSY)
+                continue
+            if self.headless:
+                # 无窗口模式的浏览器会自报 HeadlessChrome，抖音据此拦截；换成普通 Chrome 的标识重开
+                try:
+                    pg = self.ctx.pages[0] if self.ctx.pages else self.ctx.new_page()
+                    ua = pg.evaluate("() => navigator.userAgent")
+                    if "Headless" in ua:
+                        self.ctx.close()
+                        self.ctx = self._pw.chromium.launch_persistent_context(
+                            **kwargs, user_agent=ua.replace("HeadlessChrome", "Chrome"))
+                except Exception as e:  # noqa: BLE001
+                    last_err = str(e)
+                    self.ctx = None
+                    continue
+            return ""
+        return last_err
 
     def close(self) -> None:
         try:

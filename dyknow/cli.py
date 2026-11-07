@@ -5,6 +5,7 @@
     RESULT: {"ok": ..., "code": ..., ...}
 退出码：0 全部成功 / 1 出错 / 2 需要扫码登录 / 3 抖音或浏览器问题（看 RESULT 里的 reason）
        4 命令跑完了，但有条目失败或被中断（看 RESULT 里的 failed / pending）
+       5 等用户操作：把 RESULT 里的二维码图片（qr）或页面截图（page）发给用户，再运行 dyknow login --wait
 """
 
 from __future__ import annotations
@@ -17,20 +18,20 @@ import sys
 from datetime import datetime
 from pathlib import Path
 
-from . import __version__, asr, browser, index, migrate, note
+from . import __version__, asr, browser, index, migrate, note, remote_login
 from .config import DEFAULTS, Config, load
 from .douyin import (Video, find_links, is_shipin_link, is_short_link, parse_aweme, sec_uid_from_url,
                      video_id_from_url)
 from .pipeline import Runner, Stats
 from .store import FOLDER_CREATOR, FOLDER_FAVORITES, FOLDER_LINKS, FOLDER_SEARCH, Store
 
-OK, ERROR, NEED_LOGIN, PLATFORM, PARTIAL = 0, 1, 2, 3, 4
+OK, ERROR, NEED_LOGIN, PLATFORM, PARTIAL, WAIT_USER = 0, 1, 2, 3, 4, 5
 
 NEXT_STEP = {
     browser.LOGIN: "运行 dyknow login 扫码登录（只需一次），然后重新运行刚才的命令",
     browser.BLOCKED: "等 10-30 分钟再试，不要连续重试；还不行就运行 dyknow doctor，把输出发给开发者",
     browser.BUSY: "关掉其他正在运行的 dyknow 和它打开的浏览器窗口，再重试",
-    browser.NO_BROWSER: "安装 Chrome 浏览器，或运行：python -m playwright install chromium",
+    browser.NO_BROWSER: "安装 Chrome 浏览器，或运行：python -m playwright install --with-deps chromium",
     browser.EMPTY: "确认传入的链接对不对（博主主页链接或分享链接）",
 }
 
@@ -245,7 +246,78 @@ def _research_finish(ctx: Ctx, command: str, out, ok_next: str) -> int:
                       saved=out.stats.new, transcribed=out.stats.transcribed, raw_dir=str(out.raw_dir or ""))
 
 
+SCAN_HOWTO = ("请用户：① 长按图片保存到手机相册（或截屏）；② 打开抖音 App，点首页左上角「≡」或搜索页里的「扫一扫」；"
+              "③ 点扫一扫页面右上角「相册」，选这张图；④ 在手机上点「确认登录」。"
+              "如果相册识别不了，就把图片放到另一块屏幕（电脑、平板、别人手机）上，用自己的抖音直接扫")
+
+
+def _remote_result(ctx: Ctx, st: dict, command: str = "login") -> int:
+    """把后台登录进程的状态翻译成给 AI 的提示"""
+    state = st.get("state")
+    if state == remote_login.LOGGED_IN:
+        ctx.log("✅ 已经是登录状态，不需要再扫码。" if st.get("already") else "✅ 登录成功。登录状态保存在这台电脑上，以后不用再扫码。")
+        return ctx.finish(command, OK, "运行 dyknow update 同步收藏（登录后才能看到收藏有多少条）", state=state)
+    if state in (remote_login.QR_READY, remote_login.SCANNED):
+        qr = st.get("qr", "")
+        if state == remote_login.SCANNED:
+            ctx.log("📱 已扫码，等用户在手机上点「确认登录」…")
+        elif st.get("qr_refreshed"):
+            ctx.log(f"🔄 二维码过期，已换了一张新的：{qr}")
+        else:
+            ctx.log(f"🖼️ 抖音登录二维码已保存成图片：{qr}")
+        if not st.get("qr_exact", True):
+            ctx.log("（没能单独裁出二维码，图片是整个登录页的截图，二维码在里面）")
+        left = max(0, int(st.get("expires_at", 0) - __import__("time").time()))
+        nxt = ("把这张图片发给用户（直接发图片文件，不要只发路径）。" + SCAN_HOWTO
+               + f"。发完马上运行 dyknow login --wait 等待（登录窗口还剩约 {left // 60} 分钟）")
+        if state == remote_login.SCANNED:
+            nxt = "请用户在抖音 App 里点「确认登录」，然后运行 dyknow login --wait"
+        return ctx.finish(command, WAIT_USER, nxt, state=state, qr=qr, qr_refreshed=bool(st.get("qr_refreshed")),
+                          seconds_left=left)
+    if state == remote_login.NEED_CODE:
+        page = st.get("page", "")
+        if st.get("code_result") == "no_input":
+            ctx.log("⚠️ 页面上没找到填验证码的地方")
+        ctx.log("🔐 抖音要求短信验证" + ("，验证码已发送到用户绑定的手机" if st.get("code_sent") else "") + f"。页面截图：{page}")
+        return ctx.finish(command, WAIT_USER,
+                          "把页面截图发给用户，问他收到的短信验证码，然后运行 dyknow login --code <验证码>",
+                          state=state, page=page)
+    if state == remote_login.CAPTCHA:
+        ctx.log("🧩 抖音要求滑块/图形验证，这台电脑上没法远程完成。")
+        return ctx.finish(command, PLATFORM, "过 30 分钟再运行 dyknow login --force 试一次；还不行，请用户在自己的电脑上登录",
+                          state=state, reason="captcha", page=st.get("page", ""))
+    if state == remote_login.TIMEOUT:
+        ctx.log("⌛ 5 分钟内没有完成扫码，登录窗口已关闭。")
+        return ctx.finish(command, NEED_LOGIN, "等用户准备好再运行 dyknow login，生成新的二维码", state=state, reason="timeout")
+    reason, detail = st.get("reason", "error"), st.get("detail", "")
+    if reason in browser.REASON_TEXT:
+        ctx.log(f"❌ {detail or browser.REASON_TEXT[reason]}")
+        return ctx.finish(command, PLATFORM, NEXT_STEP.get(reason, ""), state=state, reason=reason, detail=detail)
+    ctx.log(f"❌ 登录没能完成：{detail}")
+    return ctx.finish(command, ERROR, "运行 dyknow login 重新开始", state=state, reason=reason, detail=detail)
+
+
 def cmd_login(ctx: Ctx, args) -> int:
+    if getattr(args, "worker", ""):
+        return remote_login.run_worker(args.worker, log=ctx.log)
+    if getattr(args, "code", ""):
+        ctx.log("填写验证码…")
+        return _remote_result(ctx, remote_login.submit_code(ctx.cfg, args.code))
+    if getattr(args, "wait", False):
+        st = remote_login.read_status(ctx.cfg)
+        if st.get("state") in (remote_login.QR_READY, remote_login.SCANNED):
+            ctx.log("等用户扫码（最多约 4 分钟）…")
+        st = remote_login.wait(ctx.cfg, args.timeout)
+        if st.get("still_waiting") and st.get("state") == remote_login.QR_READY:
+            ctx.log("还没扫码。")
+            return ctx.finish("login", WAIT_USER, "问用户扫了没有；扫完后再运行 dyknow login --wait（二维码过期会自动换新）",
+                              state=st.get("state"), qr=st.get("qr", ""))
+        return _remote_result(ctx, st)
+    site = getattr(args, "site", "") or ""
+    if not site and (getattr(args, "qr", False) or not browser.has_display()):
+        ctx.log("这台电脑没有可以给你看的屏幕，改用「二维码图片」登录：正在打开抖音登录页…"
+                if not getattr(args, "qr", False) else "正在打开抖音登录页，生成二维码图片…")
+        return _remote_result(ctx, remote_login.start(ctx.cfg, force=args.force))
     site = getattr(args, "site", "") or ""
     if site:
         from . import sites
@@ -624,7 +696,8 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="dyknow", description="抖音收藏 → 本地 Markdown 知识库",
                                 formatter_class=argparse.RawDescriptionHelpFormatter, epilog="""
 常用：
-  dyknow login                     扫码登录（只需一次）
+  dyknow login                     扫码登录（只需一次；没有屏幕时自动生成二维码图片）
+  dyknow login --wait              手机扫完二维码图片后，等登录完成
   dyknow update                    同步新收藏并转录
   dyknow link "分享文案或链接"       处理单个视频
   dyknow search 关键词 --limit 20   搜索并转录
@@ -642,6 +715,11 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("login", help="扫码登录（只需一次）")
     s.add_argument("--force", action="store_true", help="清除登录状态重新扫码（换账号用）")
     s.add_argument("--site", default="", help="登录其他平台：xhs（小红书）/ zhihu（知乎）/ bili（B站），不填 = 抖音")
+    s.add_argument("--qr", action="store_true", help="把二维码存成图片（手机 / 云电脑用；没有屏幕时自动启用）")
+    s.add_argument("--wait", action="store_true", help="等用户扫完二维码图片")
+    s.add_argument("--timeout", type=int, default=240, help="--wait 最多等多少秒（默认 240）")
+    s.add_argument("--code", default="", help="抖音要求短信验证时，填入用户收到的验证码")
+    s.add_argument("--worker", default="", help=argparse.SUPPRESS)
 
     s = sub.add_parser("update", help="同步新收藏并转录")
     s.add_argument("--limit", type=int, default=0, help="最多检查最新多少条收藏")

@@ -66,8 +66,45 @@ window.addEventListener('scroll', () => more());
 """
 
 
+LOGIN_PAGE = """<html><body>
+<div>douyin home</div><button id="login" onclick="openLogin()">登录</button>
+<div id="dlg" style="display:none;padding:30px;background:#fff">
+  <p>扫码登录</p><p id="tip">打开抖音App扫码</p>
+  <div class="qrcode-wrapper"><img id="qr" width="180" height="180"></div>
+</div>
+<div id="verify" style="display:none">
+  <p>身份验证</p><input id="code" placeholder="请输入验证码" maxlength="6">
+  <span onclick="sent=true">获取验证码</span><button onclick="submitCode()">验证</button>
+</div>
+<script>
+let gen = 0, sent = false;
+function qrSrc(g) { return 'data:image/svg+xml;utf8,' + encodeURIComponent(
+  '<svg xmlns="http://www.w3.org/2000/svg" width="180" height="180"><rect width="180" height="180" fill="#fff"/>'
+  + '<rect x="10" y="10" width="' + (40 + g * 10) + '" height="60" fill="#000"/></svg>'); }
+function openLogin() { document.getElementById('dlg').style.display = 'block';
+  document.getElementById('qr').src = qrSrc(gen); }
+async function submitCode() {
+  const r = await fetch('/test/code?c=' + document.getElementById('code').value); const d = await r.json();
+  if (d.ok) document.cookie = 'sessionid=abc; path=/; max-age=86400'; }
+setInterval(async () => {
+  const d = await (await fetch('/test/qrstatus')).json();
+  const tip = document.getElementById('tip');
+  if (d.s === 'scanned') tip.textContent = '扫码成功，请在手机上确认';
+  if (d.s === 'expired') tip.innerHTML = '二维码已失效 <a onclick="refresh()">刷新</a>';
+  if (d.s === 'confirmed') document.cookie = 'sessionid=abc; path=/; max-age=86400';
+  if (d.s === 'verify') { document.getElementById('dlg').style.display = 'none';
+    document.getElementById('verify').style.display = 'block'; }
+}, 700);
+async function refresh() { await fetch('/test/refresh'); gen += 1; document.getElementById('qr').src = qrSrc(gen);
+  document.getElementById('tip').textContent = '打开抖音App扫码'; }
+</script></body></html>"""
+
+
 class FakeDouyin:
-    def __init__(self, n_favorites: int = 45, mode: str = "ok"):
+    def __init__(self, n_favorites: int = 45, mode: str = "ok", login_page: bool = False):
+        self.login_page = login_page
+        self.qr_state = "waiting"   # waiting / scanned / confirmed / expired / verify
+        self.sms_code = "123456"
         self.mode = mode
         self.n_favorites = n_favorites
         self.requests: list[str] = []
@@ -187,6 +224,16 @@ more(); window.addEventListener('scroll', more);
                     self.wfile.flush()
                     time.sleep(120)
                     return
+                if u.path == "/test/qrstatus":
+                    return self._send(200, json.dumps({"s": fake.qr_state}))
+                if u.path == "/test/refresh":
+                    fake.qr_state = "waiting"
+                    return self._send(200, "{}")
+                if u.path == "/test/code":
+                    ok = q.get("c", [""])[0] == fake.sms_code
+                    return self._send(200, json.dumps({"ok": ok}))
+                if fake.login_page and u.path == "/":
+                    return self._send(200, LOGIN_PAGE, "text/html")
                 if u.path.startswith("/video/"):
                     return self._send(200, "<html><body>video</body></html>", "text/html")
                 self._send(200, "<html><body>douyin home</body></html>", "text/html")
