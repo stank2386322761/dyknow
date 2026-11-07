@@ -4,10 +4,10 @@
 
 流程：
   dyknow login            没有屏幕时自动走这里：后台开浏览器，二维码存成图片，立刻返回（退出码 5）
-  dyknow login --wait     等用户扫码，最多约 4 分钟；二维码过期会自动刷新并提示重新发图
+  dyknow login --wait     用户说扫好了之后运行，确认登录结果；二维码过期会自动刷新并提示重新发图
   dyknow login --code 123456   抖音扫码后要求短信验证时，把用户收到的验证码填进去
 
-后台进程最多保持 5 分钟，登录成功或超时后自己退出；状态写在 <数据目录>/login/status.json。
+后台进程最多保持 10 分钟，登录成功或超时后自己退出；状态写在 <数据目录>/login/status.json。
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from typing import Callable
 from . import browser
 from .config import Config
 
-WORKER_SECONDS = 300
+WORKER_SECONDS = 600
 
 # 状态
 STARTING = "starting"

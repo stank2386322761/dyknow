@@ -5,7 +5,7 @@
     RESULT: {"ok": ..., "code": ..., ...}
 退出码：0 全部成功 / 1 出错 / 2 需要扫码登录 / 3 抖音或浏览器问题（看 RESULT 里的 reason）
        4 命令跑完了，但有条目失败或被中断（看 RESULT 里的 failed / pending）
-       5 等用户操作：把 RESULT 里的二维码图片（qr）或页面截图（page）发给用户，再运行 dyknow login --wait
+       5 等用户操作：把 RESULT 里的二维码图片（qr）发给用户并结束这一轮回复，用户回复后再运行 dyknow login --wait / --code
 """
 
 from __future__ import annotations
@@ -277,7 +277,7 @@ def _remote_result(ctx: Ctx, st: dict, command: str = "login") -> int:
             ctx.log("（没能单独裁出二维码，图片是整个登录页的截图，二维码在里面）")
         left = max(0, int(st.get("expires_at", 0) - __import__("time").time()))
         nxt = ("把这张图片发给用户（直接发图片文件，不要只发路径）。" + SCAN_HOWTO
-               + f"。发完马上运行 dyknow login --wait 等待（登录窗口还剩约 {left // 60} 分钟）")
+               + f"。发完图就结束这一轮回复（很多 AI 应用要等这一轮回复结束才会把图片显示给用户，所以不要接着运行 --wait 干等）；等用户回复「扫好了」再运行 dyknow login --wait（登录窗口还剩约 {left // 60} 分钟）")
         if state == remote_login.SCANNED:
             nxt = "请用户在抖音 App 里点「确认登录」，然后运行 dyknow login --wait"
         return ctx.finish(command, WAIT_USER, nxt, state=state, qr=qr, qr_refreshed=bool(st.get("qr_refreshed")),
@@ -309,7 +309,7 @@ def _remote_result(ctx: Ctx, st: dict, command: str = "login") -> int:
         return ctx.finish(command, PLATFORM, "过 30 分钟再运行 dyknow login --force 试一次；还不行，请用户在自己的电脑上登录",
                           state=state, reason="captcha", page=st.get("page", ""))
     if state == remote_login.TIMEOUT:
-        ctx.log("⌛ 5 分钟内没有完成扫码，登录窗口已关闭。")
+        ctx.log("⌛ 10 分钟内没有完成登录，登录窗口已关闭。")
         return ctx.finish(command, NEED_LOGIN, "等用户准备好再运行 dyknow login，生成新的二维码", state=state, reason="timeout")
     reason, detail = st.get("reason", "error"), st.get("detail", "")
     if reason in browser.REASON_TEXT:
@@ -336,11 +336,11 @@ def cmd_login(ctx: Ctx, args) -> int:
     if getattr(args, "wait", False):
         st = remote_login.read_status(ctx.cfg)
         if st.get("state") in (remote_login.QR_READY, remote_login.SCANNED):
-            ctx.log("等用户扫码（最多约 4 分钟）…")
+            ctx.log("检查扫码结果…")
         st = remote_login.wait(ctx.cfg, args.timeout)
         if st.get("still_waiting") and st.get("state") == remote_login.QR_READY:
             ctx.log("还没扫码。")
-            return ctx.finish("login", WAIT_USER, "问用户扫了没有；扫完后再运行 dyknow login --wait（二维码过期会自动换新）",
+            return ctx.finish("login", WAIT_USER, "结束这一轮回复，问用户扫了没有；用户说扫好了再运行 dyknow login --wait（二维码过期会自动换新）",
                               state=st.get("state"), qr=st.get("qr", ""))
         return _remote_result(ctx, st)
     site = getattr(args, "site", "") or ""
@@ -756,7 +756,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--phone", default="", help="用手机号 + 短信验证码登录（不用扫码；遇到滑块验证会自动改成扫码）")
     s.add_argument("--qr", action="store_true", help="把二维码存成图片（手机 / 云电脑用；没有屏幕时自动启用）")
     s.add_argument("--wait", action="store_true", help="等用户扫完二维码图片")
-    s.add_argument("--timeout", type=int, default=240, help="--wait 最多等多少秒（默认 240）")
+    s.add_argument("--timeout", type=int, default=90, help="--wait 最多等多少秒（默认 90）")
     s.add_argument("--code", default="", help="抖音要求短信验证时，填入用户收到的验证码")
     s.add_argument("--worker", default="", help=argparse.SUPPRESS)
 
