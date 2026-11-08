@@ -1,183 +1,149 @@
+"""配置：一个 JSON 文件 + 环境变量覆盖。
+
+数据目录（登录用的浏览器目录、配置、日志、模型）放在用户目录下，
+不放进项目文件夹，也不放进同步盘，避免被同步软件锁住或复制。
 """
-配置管理模块
 
-笔记输出目录的解析优先级（高 → 低）：
-
-    1. 运行时覆盖（CLI `--output` / 调用方直接赋值）
-    2. `DYKNOW_OUTPUT_DIR` 环境变量
-    3. `data/config.json` 里保存的 output_dir（首次使用写入，之后长期记住）
-    4. `<当前工作目录>/抖音收藏`
-
-第 3 条是本模块的核心：SKILL.md 要求「首次确认一次输出目录，后续都用它」，
-仅靠环境变量做不到跨会话记住，因此提供最小的持久化配置文件。
-
-配置文件放在 data_dir 下；Git 工作树默认共用主项目 data，敏感文件由 .gitignore 排除。
-"""
+from __future__ import annotations
 
 import json
 import os
+import platform
 from dataclasses import dataclass, field
 from pathlib import Path
 
-CONFIG_FILENAME = "config.json"
 
-
-def default_data_dir(project_root: Path | None = None) -> Path:
-    """Git 工作树共享主仓库 data；普通目录仍使用本项目 data。"""
-    override = os.environ.get("DYKNOW_DATA_DIR", "").strip()
+def default_home() -> Path:
+    override = os.environ.get("DYKNOW_HOME", "").strip()
     if override:
         return Path(override).expanduser().resolve()
-    root = project_root or Path(__file__).resolve().parent.parent
-    marker = root / ".git"
-    if marker.is_file():
-        try:
-            value = marker.read_text(encoding="utf-8").strip()
-            if value.startswith("gitdir:"):
-                git_dir = (root / value.split(":", 1)[1].strip()).resolve()
-                common = (git_dir / (git_dir / "commondir").read_text(encoding="utf-8").strip()).resolve()
-                if common.name == ".git":
-                    return common.parent / "data"
-        except (OSError, ValueError):
-            pass
-    return root / "data"
+    system = platform.system()
+    if system == "Windows":
+        base = Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local")
+    elif system == "Darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
+    return base / "dyknow"
+
+
+# 每个配置项：默认值 + 一句说明（config 命令会显示）
+DEFAULTS: dict[str, tuple[object, str]] = {
+    "output_dir": (str(Path.home() / "抖音知识库"), "笔记保存目录"),
+    "asr": ("auto", "转录方式：auto / local（本机显卡或CPU）/ cloud（硅基流动）/ none"),
+    "model": ("auto", "本地模型：auto（有显卡用 large-v3-turbo，否则 small）或模型名"),
+    "device": ("auto", "本地转录设备：auto / cuda / cpu"),
+    "language": ("auto", "转录语言：auto（自动识别，中英混合也行）/ zh / en"),
+    "siliconflow_api_key": ("", "云端转录的 API Key（asr=cloud 时需要）"),
+    "template": ("general", "AI 整理模板：general / creator / 自定义模板文件路径"),
+    "comments": (5, "每条视频附带的热门评论数，0 = 不抓"),
+    "niche": ("", "我的账号方向，比如\"AI 工具和自媒体变现\"，AI 挑选题时会参考"),
+    "frames": (0, "每条视频截取多少张画面（给能看图的 AI 用），0 = 不截；建议 8"),
+    "update_limit": (200, "update 最多检查多少条最新收藏"),
+    "batch": (10, "每次运行最多转录多少条（其余保持待转录，再运行 dyknow transcribe 接着转），0 = 不限"),
+    "browser": ("auto", "浏览器：auto（依次尝试 Chrome、Edge、内置 Chromium）/ chrome / msedge / chromium"),
+    "headless": (False, "抓取时是否隐藏浏览器窗口（抖音可能拦截隐藏窗口，默认不隐藏）"),
+    "request_interval": (1.5, "两次请求之间的间隔秒数，太小容易被限流"),
+    "hf_mirror": (True, "下载模型时使用国内镜像 hf-mirror.com"),
+}
+
+ENV_OVERRIDES = {
+    "output_dir": "DYKNOW_OUTPUT",
+    "asr": "DYKNOW_ASR",
+    "model": "DYKNOW_MODEL",
+    "device": "DYKNOW_DEVICE",
+    "siliconflow_api_key": "SILICONFLOW_API_KEY",
+}
 
 
 @dataclass
 class Config:
-    """全局配置，支持环境变量与配置文件覆盖"""
-
-    # 数据目录（cookie、数据库、视频缓存、配置文件）
-    data_dir: Path = field(default_factory=default_data_dir)
-
-    # 默认同步数量
-    default_count: int = 200
-
-    # 是否保留临时缓存文件（视频/音频）
-    # 某些运行环境对批量删除有限制（例如每轮最多删 N 个文件），
-    # 大批量转录时会把进程拦停。置为 True 可由调用方在结束后统一清理。
-    keep_media_cache: bool = os.environ.get(
-        "DYKNOW_KEEP_MEDIA_CACHE", ""
-    ).strip().lower() in ("1", "true", "yes")
-
-    # 转录时每条之间的随机休息上限（秒），用于降低被限流概率。
-    # 设为 0 则不休息。通过 DYKNOW_TRANSCRIBE_DELAY 设置。
-    transcribe_delay: float = float(
-        os.environ.get("DYKNOW_TRANSCRIBE_DELAY", "0") or "0"
-    )
-
-    # AI 摘要后端: "claude" | "openai" | "ollama" | None
-    summary_backend: str | None = os.environ.get("DYKNOW_SUMMARY_BACKEND", None)
-    summary_model: str = os.environ.get("DYKNOW_SUMMARY_MODEL", "claude-sonnet-4-6")
-
-    # 转录模型 — pywhispercpp (whisper.cpp GGML)
-    # 默认使用 ggml-tiny.bin (74MB)，可切换为 ggml-small.bin (465MB)
-    ggml_model_path: str = field(default_factory=lambda: os.environ.get("DYKNOW_GGML_MODEL", ""))
-
-    def __post_init__(self):
-        # 运行时覆盖（--output）。不作为 dataclass 字段，避免污染 __init__ 签名。
-        self.data_dir = Path(self.data_dir)
-        if not self.ggml_model_path:
-            self.ggml_model_path = str(self.data_dir / "models" / "ggml-tiny.bin")
-        self._output_override: Path | None = None
-
-    # ── 派生路径 ──────────────────────────────
+    home: Path = field(default_factory=default_home)
+    values: dict = field(default_factory=dict)
+    # 测试用：替换抖音站点地址
+    base_url: str = "https://www.douyin.com"
+    # 测试用：替换其他平台地址，如 {"xhs.www": "http://127.0.0.1:1234"}
+    site_urls: dict = field(default_factory=dict)
 
     @property
-    def cookie_path(self) -> Path:
-        """Cookie 文件路径"""
-        return self.data_dir / "cookies.json"
+    def path(self) -> Path:
+        return self.home / "config.json"
 
     @property
-    def db_path(self) -> Path:
-        """SQLite 数据库路径"""
-        return self.data_dir / "dyknow.db"
+    def profile_dir(self) -> Path:
+        return self.home / "browser-profile"
 
     @property
-    def video_cache_dir(self) -> Path:
-        """视频缓存目录（转录后删除）"""
-        p = self.data_dir / "videos"
-        p.mkdir(parents=True, exist_ok=True)
-        return p
+    def cache_dir(self) -> Path:
+        return self.home / "cache"
 
     @property
-    def config_path(self) -> Path:
-        """持久化配置文件路径"""
-        return self.data_dir / CONFIG_FILENAME
+    def models_dir(self) -> Path:
+        return self.home / "models"
 
-    # ── 配置文件读写 ──────────────────────────
-
-    def read_config_file(self) -> dict:
-        """读取配置文件。不存在或内容损坏时返回空 dict，绝不抛异常。"""
-        try:
-            data = json.loads(self.config_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError, UnicodeDecodeError):
-            return {}
-        return data if isinstance(data, dict) else {}
-
-    def save_output_dir(self, path) -> Path:
-        """
-        把笔记输出目录写入配置文件，之后每次运行都会记住。
-
-        传入相对路径时按当前工作目录展开为绝对路径（避免日后 cwd 变化导致漂移）。
-        返回规范化后的路径。
-        """
-        target = Path(path).expanduser()
-        if not target.is_absolute():
-            target = Path.cwd() / target
-        target = Path(os.path.normpath(str(target)))
-
-        data = self.read_config_file()
-        data["output_dir"] = str(target)
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.config_path.write_text(
-            json.dumps(data, ensure_ascii=False, indent=2) + "\n",
-            encoding="utf-8",
-        )
-        return target
-
-    # ── 输出目录 ──────────────────────────────
+    @property
+    def logs_dir(self) -> Path:
+        return self.home / "logs"
 
     @property
     def output_dir(self) -> Path:
-        """
-        笔记输出目录。
+        return Path(str(self.get("output_dir"))).expanduser()
 
-        优先级：运行时覆盖 > DYKNOW_OUTPUT_DIR > data/config.json > cwd/抖音收藏
-        """
-        if self._output_override is not None:
-            return self._output_override
+    def get(self, key: str):
+        if key not in DEFAULTS:
+            raise KeyError(key)
+        env = ENV_OVERRIDES.get(key)
+        if env and os.environ.get(env, "").strip():
+            return _coerce(key, os.environ[env].strip())
+        if key in self.values:
+            return self.values[key]
+        return DEFAULTS[key][0]
 
-        env = (os.environ.get("DYKNOW_OUTPUT_DIR") or "").strip()
-        if env:
-            return Path(env)
+    def source_of(self, key: str) -> str:
+        env = ENV_OVERRIDES.get(key)
+        if env and os.environ.get(env, "").strip():
+            return f"环境变量 {env}"
+        if key in self.values:
+            return "配置文件"
+        return "默认值"
 
-        saved = str(self.read_config_file().get("output_dir") or "").strip()
-        if saved:
-            return Path(saved)
+    def set(self, key: str, raw) -> object:
+        if key not in DEFAULTS:
+            raise KeyError(key)
+        value = _coerce(key, raw)
+        if key == "output_dir":
+            p = Path(str(value)).expanduser()
+            value = str(p if p.is_absolute() else (Path.cwd() / p).resolve())
+        self.values[key] = value
+        self.save()
+        return value
 
-        return Path.cwd() / "抖音收藏"
-
-    @output_dir.setter
-    def output_dir(self, value) -> None:
-        """运行时覆盖输出目录（不写盘）。传 None 表示清除覆盖。"""
-        self._output_override = Path(value).expanduser() if value else None
-
-    def output_dir_source(self) -> str:
-        """说明当前输出目录来自哪一级，便于 status / config --show 展示"""
-        if self._output_override is not None:
-            return "运行时覆盖（--output）"
-        if (os.environ.get("DYKNOW_OUTPUT_DIR") or "").strip():
-            return "环境变量 DYKNOW_OUTPUT_DIR"
-        if str(self.read_config_file().get("output_dir") or "").strip():
-            return f"配置文件 {self.config_path}"
-        return "默认值（当前工作目录）"
-
-    def ensure_dirs(self):
-        """确保所有需要的目录存在"""
-        self.data_dir.mkdir(parents=True, exist_ok=True)
-        self.video_cache_dir.mkdir(parents=True, exist_ok=True)
-        self.output_dir.mkdir(parents=True, exist_ok=True)
+    def save(self) -> None:
+        self.home.mkdir(parents=True, exist_ok=True)
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.values, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, self.path)
 
 
-# 全局单例
-config = Config()
+def _coerce(key: str, raw):
+    default = DEFAULTS[key][0]
+    if isinstance(default, bool):
+        if isinstance(raw, bool):
+            return raw
+        return str(raw).strip().lower() in ("1", "true", "yes", "on", "是")
+    if isinstance(default, int) and not isinstance(default, bool):
+        return int(raw)
+    if isinstance(default, float):
+        return float(raw)
+    return str(raw)
+
+
+def load(home: Path | None = None) -> Config:
+    cfg = Config(home=home or default_home())
+    try:
+        data = json.loads(cfg.path.read_text(encoding="utf-8"))
+        if isinstance(data, dict):
+            cfg.values = {k: v for k, v in data.items() if k in DEFAULTS}
+    except (OSError, ValueError):
+        pass
+    return cfg
