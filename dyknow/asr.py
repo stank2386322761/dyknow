@@ -225,8 +225,45 @@ def _probe_error(out: str, code: int) -> str:
 ZH_PROMPT = "以下是普通话的视频内容，可能夹杂English单词，使用简体中文，并加上逗号、句号和问号。"
 
 
+_NO_AUDIO = ("does not contain any stream", "matches no streams", "Output file is empty",
+             "Stream map '0:a", "no audio")
+
+
+def _ffmpeg_decode(path: Path):
+    """用 ffmpeg 直接解成 16kHz 单声道 float32，不经过 PyAV。
+
+    PyAV 19（2026-09-29）去掉了 faster-whisper 1.2.1 还在用的 metadata_errors 参数，
+    所有用 decode_audio 的转录都会报 TypeError；ffmpeg 本来就是下载视频要用的，直接用它最稳。
+    返回 None 表示这台电脑上没有 ffmpeg。
+    """
+    import subprocess
+
+    import numpy as np
+
+    from .media import _NO_WINDOW, ffmpeg_exe
+
+    exe = ffmpeg_exe()
+    if not exe:
+        return None
+    try:
+        p = subprocess.run([exe, "-nostdin", "-hide_banner", "-loglevel", "error", "-i", str(path),
+                            "-map", "0:a:0", "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", "-"],
+                           capture_output=True, timeout=1800, creationflags=_NO_WINDOW)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        raise AsrError(f"读取音频失败：{type(e).__name__}")
+    err = p.stderr.decode("utf-8", "replace")
+    if p.returncode != 0 or not p.stdout:
+        if not p.stdout and (p.returncode == 0 or any(k in err for k in _NO_AUDIO)):
+            raise AsrError("文件里没有声音轨（只有画面）")
+        raise AsrError(f"读取音频失败：{err.strip().splitlines()[-1][:120] if err.strip() else p.returncode}")
+    return np.frombuffer(p.stdout[: len(p.stdout) // 4 * 4], dtype=np.float32).copy()
+
+
 def decode(path: Path):
     """读出 16kHz 音频；文件没有声音时给出能看懂的错误，而不是 IndexError"""
+    audio = _ffmpeg_decode(path)
+    if audio is not None:
+        return audio
     try:
         from faster_whisper import decode_audio
     except ImportError:

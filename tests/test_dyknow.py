@@ -18,7 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import yaml  # noqa: E402
 
-from dyknow import asr, browser, cli, index, migrate, note  # noqa: E402
+from dyknow import asr, browser, cli, index, migrate, note, remote_login  # noqa: E402
 from dyknow.config import Config  # noqa: E402
 from dyknow.douyin import (Comment, Video, find_links, parse_aweme, sec_uid_from_url,  # noqa: E402
                            video_id_from_url)
@@ -814,6 +814,32 @@ class TestSearchDoesNotHang(unittest.TestCase):
 # ── 手机 / 云电脑登录（二维码图片）──────────────
 
 
+class TestDecodeWithoutPyAV(unittest.TestCase):
+    """PyAV 19 让 faster-whisper 的 decode_audio 全部报 TypeError：读音频不能再依赖它"""
+
+    def test_decode_ignores_broken_pyav(self):
+        import types
+        saved = sys.modules.get("faster_whisper")
+        fw = types.ModuleType("faster_whisper")
+
+        def broken(*a, **k):
+            raise TypeError("open() got an unexpected keyword argument 'metadata_errors'")
+        fw.decode_audio = broken
+        sys.modules["faster_whisper"] = fw
+        try:
+            fx = Path(__file__).parent / "fixtures"
+            audio = asr.decode(fx / "static_talk.mp4")
+            self.assertGreater(len(audio), 16000)
+            self.assertEqual(str(audio.dtype), "float32")
+            with self.assertRaisesRegex(asr.AsrError, "没有声音轨"):
+                asr.decode(fx / "video_only.mp4")
+        finally:
+            if saved is None:
+                sys.modules.pop("faster_whisper", None)
+            else:
+                sys.modules["faster_whisper"] = saved
+
+
 class TestRemoteLogin(unittest.TestCase):
     def setUp(self):
         os.environ["DYKNOW_REMOTE"] = "1"   # 假装没有屏幕
@@ -853,6 +879,63 @@ class TestRemoteLogin(unittest.TestCase):
             code, out, res = run_cli(["update", "--no-transcribe"], self.cfg)
             self.assertIn(code, (cli.OK, cli.PARTIAL), out)
             self.assertEqual(res["found"], 5, out)
+
+    def test_qr_expired_before_wait_gives_new_image(self):
+        """发图之后、用户说扫好了之前二维码就过期换新了：--wait 要马上把新图交出来，不能干等旧码"""
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            code, out, res = run_cli(["login"], self.cfg)
+            self.assertEqual(res["state"], "qr_ready", out)
+            fake.qr_state = "expired"
+            deadline = time.time() + 20
+            while time.time() < deadline and remote_login.read_status(self.cfg).get("qr_version", 0) < 2:
+                time.sleep(0.3)
+            t0 = time.time()
+            code, out, res = run_cli(["login", "--wait", "--timeout", "60"], self.cfg)
+            self.assertEqual((code, res["qr_refreshed"]), (cli.WAIT_USER, True), out)
+            self.assertLess(time.time() - t0, 15, out)
+            fake.qr_state = "confirmed"
+            code, out, res = run_cli(["login", "--wait", "--timeout", "30"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
+
+    def test_said_scanned_but_douyin_saw_nothing(self):
+        """用户说扫了，抖音页面却一直是等待扫码：自动换新码交给用户，而不是让 AI 反复问扫了没有"""
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            run_cli(["login"], self.cfg)
+            os.environ["DYKNOW_NO_SCAN_SECONDS"] = "6"
+            try:
+                code, out, res = run_cli(["login", "--wait", "--timeout", "60"], self.cfg)
+            finally:
+                os.environ.pop("DYKNOW_NO_SCAN_SECONDS", None)
+            self.assertEqual((code, res["state"], res["not_scanned"]), (cli.WAIT_USER, "qr_ready", True), out)
+            self.assertIn("没收到这次扫码", out)
+            self.assertTrue(Path(res["qr"]).exists())
+            fake.qr_state = "confirmed"
+            code, out, res = run_cli(["login", "--wait", "--timeout", "30"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
+
+    def test_scan_mask_is_not_a_new_qr(self):
+        """扫码后码上盖了「扫码成功」，图变了但不是新码：不能让用户再扫一次"""
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            run_cli(["login"], self.cfg)
+            fake.qr_state = "scanned"
+            time.sleep(4)
+            fake.qr_state = "confirmed"
+            code, out, res = run_cli(["login", "--wait", "--timeout", "30"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
+
+    def test_verify_dialog_over_visible_qr(self):
+        """身份验证框弹出来时后面的二维码还在：要识别成需要验证码，而不是继续等扫码"""
+        with FakeDouyin(5, login_page=True) as fake:
+            self.cfg = make_cfg(tmpdir(), fake.base, headless=False)
+            run_cli(["login"], self.cfg)
+            fake.qr_state = "verify_overlay"
+            code, out, res = run_cli(["login", "--wait", "--timeout", "30"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.WAIT_USER, "need_code"), out)
+            code, out, res = run_cli(["login", "--code", "123456"], self.cfg)
+            self.assertEqual((code, res["state"]), (cli.OK, "logged_in"), out)
 
     def test_sms_verification(self):
         with FakeDouyin(5, login_page=True) as fake:

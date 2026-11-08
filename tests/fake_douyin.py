@@ -108,11 +108,13 @@ async function submitCode() {
 setInterval(async () => {
   const d = await (await fetch('/test/qrstatus')).json();
   const tip = document.getElementById('tip');
-  if (d.s === 'scanned') tip.textContent = '扫码成功，请在手机上确认';
+  if (d.s === 'scanned') { tip.textContent = '扫码成功，请在手机上确认';
+    const q = document.getElementById('qr'); if (!q.src.endsWith('#mask')) q.src = q.src + '#mask'; }
   if (d.s === 'expired') tip.innerHTML = '二维码已失效 <a onclick="refresh()">刷新</a>';
   if (d.s === 'confirmed') document.cookie = 'sessionid=abc; path=/; max-age=86400';
   if (d.s === 'verify') { document.getElementById('dlg').style.display = 'none';
     document.getElementById('verify').style.display = 'block'; }
+  if (d.s === 'verify_overlay') document.getElementById('verify').style.display = 'block';  // 登录框和二维码还在
 }, 700);
 async function refresh() { await fetch('/test/refresh'); gen += 1; document.getElementById('qr').src = qrSrc(gen);
   document.getElementById('tip').textContent = '打开抖音App扫码'; }
@@ -122,7 +124,7 @@ async function refresh() { await fetch('/test/refresh'); gen += 1; document.getE
 class FakeDouyin:
     def __init__(self, n_favorites: int = 45, mode: str = "ok", login_page: bool = False):
         self.login_page = login_page
-        self.qr_state = "waiting"   # waiting / scanned / confirmed / expired / verify
+        self.qr_state = "waiting"   # waiting / scanned / confirmed / expired / verify / verify_overlay
         self.sms_code = "123456"
         self.sms_to: list = []        # 发过短信的 (手机号, 是否勾了协议)
         self.send_captcha = False     # 发短信时弹滑块

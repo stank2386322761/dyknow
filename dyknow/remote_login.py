@@ -101,6 +101,21 @@ def _write_status(cfg: Config, **st) -> None:
     os.replace(tmp, d / "status.json")
 
 
+def mark_shown(cfg: Config, qr_version: int) -> None:
+    """记下已经发给用户的是第几张二维码。--wait 跟它比，不跟「现在是第几张」比：
+    二维码在发图之后、--wait 之前就过期换新了，也能把新图交给用户，而不是一直等一张作废的码。"""
+    d = state_dir(cfg)
+    d.mkdir(parents=True, exist_ok=True)
+    (d / "shown.json").write_text(json.dumps({"qr_version": int(qr_version or 0), "at": time.time()}), encoding="utf-8")
+
+
+def shown_version(cfg: Config) -> int | None:
+    try:
+        return int(json.loads((state_dir(cfg) / "shown.json").read_text(encoding="utf-8"))["qr_version"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return None
+
+
 def _alive(pid) -> bool:
     if not pid:
         return False
@@ -148,7 +163,7 @@ def start(cfg: Config, force: bool = False, wait_qr: int = 90, phone: str = "") 
     _stop_worker(cfg)
     d = state_dir(cfg)
     d.mkdir(parents=True, exist_ok=True)
-    for name in ("status.json", "qr.png", "page.png", "code.txt"):
+    for name in ("status.json", "qr.png", "page.png", "code.txt", "shown.json", "refresh.txt"):
         try:
             (d / name).unlink()
         except OSError:
@@ -187,15 +202,24 @@ def start(cfg: Config, force: bool = False, wait_qr: int = 90, phone: str = "") 
     return {"state": ERROR, "reason": "slow", "detail": "90 秒内没能打开抖音登录页"}
 
 
-def wait(cfg: Config, timeout: int = 240, seen_qr: int | None = None) -> dict:
-    """等到登录成功、需要用户再做点什么（新二维码 / 验证码），或超时"""
+def wait(cfg: Config, timeout: int = 240, seen_qr: int | None = None, no_scan: int = 40) -> dict:
+    """等到登录成功、需要用户再做点什么（新二维码 / 验证码），或超时。
+
+    用户说「扫好了」才会运行 --wait。如果过了 no_scan 秒抖音页面上还是「等待扫码」，
+    说明他扫的那张图已经作废（最常见：发图到扫码之间二维码过期了），直接换一张新的交给用户，
+    不再干等 90 秒、也不再让 AI 反复问「扫了没有」。
+    """
     st = read_status(cfg)
     if not st:
         return {"state": ERROR, "reason": "not_started", "detail": "还没有开始登录"}
+    if seen_qr is None:
+        seen_qr = shown_version(cfg)
     start_qr = st.get("qr_version", 0) if seen_qr is None else seen_qr
     start_state = st.get("state")
     start_code = st.get("code_result")
-    deadline = time.time() + timeout
+    begun = time.time()
+    deadline = begun + timeout
+    refresh_asked = False
     while True:
         st = read_status(cfg)
         state = st.get("state")
@@ -205,6 +229,8 @@ def wait(cfg: Config, timeout: int = 240, seen_qr: int | None = None) -> dict:
             return st
         if state in (QR_READY, SCANNED) and (st.get("qr_version", 0) != start_qr or start_state == NEED_CODE):
             st["qr_refreshed"] = True
+            if refresh_asked:
+                st["not_scanned"] = True
             return st
         if not _alive(st.get("pid")):
             st = read_status(cfg)
@@ -212,6 +238,13 @@ def wait(cfg: Config, timeout: int = 240, seen_qr: int | None = None) -> dict:
                 return st
             return {"state": ERROR, "reason": "worker_gone",
                     "detail": "后台登录进程已经不在了（可能被系统结束），需要重新开始"}
+        if (not refresh_asked and no_scan and state == QR_READY and start_state in (QR_READY, SCANNED)
+                and time.time() - begun >= no_scan
+                and time.time() - float(st.get("scanned_at") or 0) > no_scan):
+            # 等了这么久抖音还没看到扫码：让后台换一张新码
+            (state_dir(cfg) / "refresh.txt").write_text("not_scanned", encoding="utf-8")
+            refresh_asked = True
+            deadline = max(deadline, time.time() + 25)
         if time.time() >= deadline:
             st["still_waiting"] = True
             return st
@@ -306,6 +339,7 @@ def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log, phone
             dy.page.wait_for_timeout(1500)
 
     qr_version, qr_sig = 0, None
+    qr_at, qr_life, scanned_at, last_page = 0.0, 0, 0.0, 0.0
     last_written: dict = {}
     code_result, sms_sent, code_try = "", mode == "phone", 0
 
@@ -315,7 +349,8 @@ def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log, phone
             last_written.clear()
             last_written.update(key)
             _write_status(cfg, **base, state=state, via=mode, fallback=fallback, expires_at=deadline,
-                          code_result=code_result, code_try=code_try, **extra)
+                          code_result=code_result, code_try=code_try, qr_at=qr_at, qr_life=qr_life,
+                          scanned_at=scanned_at, **{"page": str(d / "page.png"), **extra})
 
     while time.time() < deadline:
         if dy.logged_in():
@@ -323,6 +358,10 @@ def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log, phone
             _write_status(cfg, **base, state=LOGGED_IN, via=mode)
             return 0
         text = dy.eval(_TEXT_JS) or ""
+        if time.time() - last_page > 8:
+            # 随时留一张整页截图：卡住时 AI 能直接发给用户看，不用猜
+            _shot(dy, d / "page.png")
+            last_page = time.time()
         if any(k in text for k in _CAPTCHA):
             _shot(dy, d / "page.png")
             _write_status(cfg, **base, state=CAPTCHA, via=mode, page=str(d / "page.png"))
@@ -346,27 +385,51 @@ def _work(cfg: Config, dy: "browser.Douyin", force: bool, base: dict, log, phone
             dy.page.wait_for_timeout(1500)
             continue
 
-        qr = dy.eval(_FIND_QR_JS)
-        if qr and any(k in text for k in _EXPIRED):
-            if dy.click_text(["刷新", "点击刷新", "刷新二维码", "二维码已失效", "二维码已过期"]):
-                dy.page.wait_for_timeout(1500)
-                continue
-            dy.open_login_dialog()
-        if qr:
-            if qr["sig"] != qr_sig:
-                _shot(dy, d / "qr.png", qr)
-                qr_sig = qr["sig"]
-                qr_version += 1
-            state = SCANNED if any(k in text for k in _SCANNED) else QR_READY
-            publish(state, qr=str(d / "qr.png"), qr_version=qr_version, qr_exact=True)
-        elif qr_version and any(k in text for k in _NEED_CODE):
-            # 扫码后抖音风控要「身份验证」：同一个会话里默认选短信，自动点发送
+        refresh_file = d / "refresh.txt"
+        if refresh_file.exists():
+            # 用户说扫了、抖音却没收到：换一张全新的二维码
+            refresh_file.unlink()
+            if not dy.click_text(["刷新", "点击刷新", "刷新二维码"], timeout=800):
+                dy.page.reload()
+                dy.page.wait_for_timeout(2500)
+                dy.open_login_dialog()
+            dy.page.wait_for_timeout(1500)
+            qr_sig = None   # 下一张找到的码一律当新码发出去
+            continue
+
+        if qr_version and any(k in text for k in _NEED_CODE):
+            # 扫码确认后抖音风控要「身份验证」：同一个会话里默认选短信，自动点发送。
+            # 放在找二维码前面：验证框弹出来时，后面的登录框和二维码常常还在页面上
             if not sms_sent:
                 dy.click_text(_SMS_OPTION, timeout=1500)
                 sms_sent = bool(dy.click_text(_SEND_CODE, timeout=1500))
                 _agree(dy)
             _shot(dy, d / "page.png")
             publish(NEED_CODE, code_sent=sms_sent, page=str(d / "page.png"), qr_version=qr_version)
+            dy.page.wait_for_timeout(1500)
+            continue
+
+        qr = dy.eval(_FIND_QR_JS)
+        scanned = any(k in text for k in _SCANNED)
+        if qr and any(k in text for k in _EXPIRED):
+            if qr_at and not qr_life:
+                qr_life = int(time.time() - qr_at)   # 这台电脑上抖音二维码实际能撑多久
+            if dy.click_text(["刷新", "点击刷新", "刷新二维码", "二维码已失效", "二维码已过期"]):
+                dy.page.wait_for_timeout(1500)
+                continue
+            dy.open_login_dialog()
+        if qr:
+            if qr["sig"] != qr_sig and not (scanned and qr_sig):
+                # 扫码后抖音会在码上盖一层「扫码成功」，图变了但不是新码，不能让用户重扫
+                _shot(dy, d / "qr.png", qr)
+                qr_sig = qr["sig"]
+                qr_version += 1
+                qr_at = time.time()
+            if scanned and not scanned_at:
+                scanned_at = time.time()
+            elif not scanned:
+                scanned_at = 0.0
+            publish(SCANNED if scanned else QR_READY, qr=str(d / "qr.png"), qr_version=qr_version, qr_exact=True)
         else:
             dy.open_login_dialog()
             dy.page.wait_for_timeout(1500)

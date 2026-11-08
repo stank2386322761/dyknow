@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -269,6 +270,8 @@ def _remote_result(ctx: Ctx, st: dict, command: str = "login") -> int:
             ctx.log("⚠️ 没找到手机号登录的输入框（抖音页面可能改版），已自动换成扫码登录。")
         if state == remote_login.SCANNED:
             ctx.log("📱 已扫码，等用户在手机上点「确认登录」…")
+        elif st.get("not_scanned"):
+            ctx.log(f"🔄 抖音没收到这次扫码：用户扫的那张二维码已经作废（多半是发图到扫码之间过期了）。已换成新的：{qr}")
         elif st.get("qr_refreshed"):
             ctx.log(f"🔄 二维码过期，已换了一张新的：{qr}")
         else:
@@ -276,11 +279,17 @@ def _remote_result(ctx: Ctx, st: dict, command: str = "login") -> int:
         if not st.get("qr_exact", True):
             ctx.log("（没能单独裁出二维码，图片是整个登录页的截图，二维码在里面）")
         left = max(0, int(st.get("expires_at", 0) - __import__("time").time()))
-        nxt = ("把这张图片发给用户（直接发图片文件，不要只发路径）。" + SCAN_HOWTO
+        if state == remote_login.QR_READY:
+            remote_login.mark_shown(ctx.cfg, st.get("qr_version", 0))
+        life = int(st.get("qr_life") or 0)
+        hurry = (f"。提醒用户：这张二维码大约 {life} 秒就会失效，收到后马上扫" if life else
+                 "。提醒用户：二维码几分钟就会失效，收到后马上扫")
+        nxt = ("把这张图片发给用户（直接发图片文件，不要只发路径）。" + SCAN_HOWTO + hurry
                + f"。发完图就结束这一轮回复（很多 AI 应用要等这一轮回复结束才会把图片显示给用户，所以不要接着运行 --wait 干等）；等用户回复「扫好了」再运行 dyknow login --wait（登录窗口还剩约 {left // 60} 分钟）")
         if state == remote_login.SCANNED:
             nxt = "请用户在抖音 App 里点「确认登录」，然后运行 dyknow login --wait"
         return ctx.finish(command, WAIT_USER, nxt, state=state, qr=qr, qr_refreshed=bool(st.get("qr_refreshed")),
+                          not_scanned=bool(st.get("not_scanned")), qr_life=life, page=st.get("page", ""),
                           seconds_left=left)
     if state == remote_login.NEED_CODE:
         page = st.get("page", "")
@@ -337,7 +346,7 @@ def cmd_login(ctx: Ctx, args) -> int:
         st = remote_login.read_status(ctx.cfg)
         if st.get("state") in (remote_login.QR_READY, remote_login.SCANNED):
             ctx.log("检查扫码结果…")
-        st = remote_login.wait(ctx.cfg, args.timeout)
+        st = remote_login.wait(ctx.cfg, args.timeout, no_scan=int(os.environ.get("DYKNOW_NO_SCAN_SECONDS") or 40))
         if st.get("still_waiting") and st.get("state") == remote_login.QR_READY:
             ctx.log("还没扫码。")
             return ctx.finish("login", WAIT_USER, "结束这一轮回复，问用户扫了没有；用户说扫好了再运行 dyknow login --wait（二维码过期会自动换新）",
