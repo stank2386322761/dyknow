@@ -1,0 +1,54 @@
+name: Bug 报告
+description: 抓取失败、转录报错、笔记格式不对
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        先运行一次 `dyknow doctor`，很多问题它会直接告诉你原因。
+
+        **提交前请删掉 API Key、Cookie、手机号和二维码截图。**
+  - type: input
+    id: version
+    attributes:
+      label: DyKnow 版本
+      description: 运行 `dyknow --version` 的结果
+      placeholder: 3.3.1
+    validations:
+      required: true
+  - type: input
+    id: env
+    attributes:
+      label: 系统环境
+      description: 操作系统 + Python 版本 + 是否有 NVIDIA 显卡
+      placeholder: Windows 11 / Python 3.12 / RTX 3060
+    validations:
+      required: true
+  - type: textarea
+    id: doctor
+    attributes:
+      label: dyknow doctor 输出
+      render: shell
+    validations:
+      required: false
+  - type: textarea
+    id: command
+    attributes:
+      label: 你运行的命令和结果
+      description: 完整命令 + 退出码 + 最后那行 `RESULT: {...}`
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: 你期望发生什么
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息
+      description: 如果是「网站改版解析失败」，把数据目录 `cache/raw/` 里的对应文件拖进来
+    validations:
+      required: false

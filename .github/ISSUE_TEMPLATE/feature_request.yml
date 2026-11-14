@@ -1,0 +1,27 @@
+name: 功能建议
+description: 希望 DyKnow 支持某个平台、某种整理方式或某类输入
+labels: [enhancement]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        提之前先看一眼 [CHANGELOG](../blob/master/CHANGELOG.md) 和 README，可能已经做了，或者在「已知限制」里。
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你现在遇到的问题
+      description: 先说场景，再说你想要的功能。比如「我收藏的视频里有很多图文，现在…」
+    validations:
+      required: true
+  - type: textarea
+    id: solution
+    attributes:
+      label: 你希望它怎么工作
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你现在的替代办法
+    validations:
+      required: false
